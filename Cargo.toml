@@ -1,0 +1,16 @@
+[package]
+name = "mdx-preview"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "prev"
+path = "src/main.rs"
+
+[dependencies]
+actix-web = "4"
+actix-ws = "0.3"
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+flate2 = "1"

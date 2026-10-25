@@ -44,6 +44,7 @@
 
 .autocomplete-suggestions { 
     overflow: auto; 
+    max-height: 440px;
     border-top: 2px solid #CBD3DD;
     font-size: 12px;
     background-color: white;
@@ -51,7 +52,9 @@
 
 .autocomplete-suggestion {
      overflow: hidden; 
-     padding: 4px; 
+     height: 22px;
+     line-height: 22px;
+     padding: 0 6px; 
      white-space: nowrap; 
      color: rgb(95, 95, 95); 
      text-overflow: ellipsis;

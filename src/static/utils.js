@@ -170,7 +170,7 @@ $(function () {
     $('#autocomplete').devbridgeAutocomplete({
         lookup: lookup_suggest_words,
         minChars: 1,
-        maxHeight: 230,
+        maxHeight: 440,
         appendTo: "#wrap",
         autoSelectFirst: true,
         onSelect: function (suggestion) {

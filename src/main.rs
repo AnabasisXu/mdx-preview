@@ -162,7 +162,11 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
             i += 1;
             s
         };
-        i += if is_utf16 { (head_size + 1) * 2 } else { head_size + 1 };
+        i += if is_utf16 {
+            (head_size + 1) * 2
+        } else {
+            head_size + 1
+        };
         let tail_size = if version >= 2.0 {
             let s = be_u16(&kb_info, i) as usize;
             i += 2;
@@ -172,7 +176,11 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
             i += 1;
             s
         };
-        i += if is_utf16 { (tail_size + 1) * 2 } else { tail_size + 1 };
+        i += if is_utf16 {
+            (tail_size + 1) * 2
+        } else {
+            tail_size + 1
+        };
         let comp = read_num(&kb_info, &mut i, width) as usize;
         let _decomp = read_num(&kb_info, &mut i, width);
         blocks.push((comp, 0));
@@ -276,16 +284,27 @@ struct Dict {
 }
 
 impl Dict {
-    fn suggest(&self, q: &str) -> Vec<(String, u32)> {
-        if q.is_empty() {
-            return self.words.clone();
-        }
+    fn suggest_page(&self, q: &str, offset: usize, limit: usize) -> (Vec<(String, u32)>, bool) {
         let q = q.to_lowercase();
-        self.words
-            .iter()
-            .filter(|(w, _)| w.to_lowercase().contains(&q))
-            .cloned()
-            .collect()
+        let mut items = Vec::with_capacity(limit);
+        let mut skipped = 0;
+        let mut has_more = false;
+        for (word, id) in &self.words {
+            if !q.is_empty() && !word.to_lowercase().contains(&q) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if items.len() < limit {
+                items.push((word.clone(), *id));
+            } else {
+                has_more = true;
+                break;
+            }
+        }
+        (items, has_more)
     }
 }
 
@@ -295,7 +314,9 @@ struct AppState {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[get("/")]
@@ -315,10 +336,10 @@ fn render_item(title: &str, body_html: &str, state: &AppState) -> String {
 
 #[get("/api/welcome")]
 async fn welcome(state: web::Data<AppState>) -> impl Responder {
-    let mut html = String::from(
-        "<div style=\"font-weight:normal;line-height:1.9;column-width:190px;\">",
-    );
-    for (word, id) in &state.dict.words {
+    // Keep the initial document bounded; the search dropdown loads later pages on scroll.
+    let mut html =
+        String::from("<div style=\"font-weight:normal;line-height:1.9;column-width:190px;\">");
+    for (word, id) in state.dict.words.iter().take(20) {
         html.push_str(&format!(
             "<a style=\"display:block;color:#276AAD;text-decoration:none;\" \
              href=\"{}/api/item/{}\">{}</a>",
@@ -360,10 +381,10 @@ async fn item(k_id: web::Path<u32>, state: web::Data<AppState>) -> impl Responde
         None => HttpResponse::NotFound().body("404"),
     }
 }
-
 #[get("/api/lookup/{word}")]
 async fn lookup(word: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
-    HttpResponse::Ok().json(state.dict.suggest(&word))
+    let (hits, has_more) = state.dict.suggest_page(&word, 0, 20);
+    HttpResponse::Ok().json(json!({"items": hits, "has_more": has_more}))
 }
 
 #[get("/api/static/{path:.*}")]
@@ -381,7 +402,9 @@ async fn static_file(path: web::Path<String>) -> impl Responder {
 #[get("/dist/{path:.*}")]
 async fn dist(path: web::Path<String>) -> impl Responder {
     match path.into_inner().as_str() {
-        "site.css" => HttpResponse::Ok().content_type("text/css; charset=utf-8").body(SITE_CSS),
+        "site.css" => HttpResponse::Ok()
+            .content_type("text/css; charset=utf-8")
+            .body(SITE_CSS),
         "utils.js" => HttpResponse::Ok()
             .content_type("application/javascript; charset=utf-8")
             .body(rebase(UTILS_JS)),
@@ -440,13 +463,14 @@ async fn ws(
                     let reply = match method {
                         "suggest_words" => {
                             let q = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
-                            let hits: Vec<[Value; 2]> = state2
-                                .dict
-                                .suggest(q)
+                            let offset =
+                                params.get(1).and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+                            let (hits, has_more) = state2.dict.suggest_page(q, offset, 20);
+                            let items: Vec<[Value; 2]> = hits
                                 .into_iter()
                                 .map(|(w, id)| [json!(w), json!(id)])
                                 .collect();
-                            json!({"id": id, "result": hits, "error": null})
+                            json!({"id": id, "result": {"items": items, "has_more": has_more}, "error": null})
                         }
                         "load_text" => {
                             let k = params.get(0).and_then(|p| p.as_u64()).unwrap_or(0) as u32;
@@ -469,7 +493,6 @@ async fn ws(
             }
         }
     });
-
     Ok(response)
 }
 
@@ -526,7 +549,11 @@ async fn main() -> std::io::Result<()> {
     }
     let _ = BASE.set(base.clone());
 
-    let dict = Arc::new(Dict { words, texts, encoding });
+    let dict = Arc::new(Dict {
+        words,
+        texts,
+        encoding,
+    });
     let (tx, _rx) = broadcast::channel(32);
     let state = web::Data::new(AppState { dict, tx });
 

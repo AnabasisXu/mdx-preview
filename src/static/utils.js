@@ -101,19 +101,20 @@ var ajax_ws = function (path, callbacks) {
 }
 
 // lookup suggest words
-var lookup_suggest_words = function (query, done) {
+var lookup_suggest_words = function (query, done, offset) {
     if (ajax == null) return;
     var suggest_words_callback = function (result, err) {
-        var ret = { suggestions: [] };
-        result instanceof Array && result.forEach(function (x) {
+        var payload = result && result.items ? result : { items: result || [], has_more: false };
+        var ret = { suggestions: [], hasMore: !!payload.has_more };
+        payload.items instanceof Array && payload.items.forEach(function (x) {
             ret.suggestions.push({
                 value: x[0],
                 k_id: x[1]
             });
-        })
+        });
         done(ret);
     }
-    ajax(suggest_words_callback, "suggest_words", query.trim());
+    ajax(suggest_words_callback, "suggest_words", query.trim(), offset || 0);
 }
 
 // force all clients redirect to the same page

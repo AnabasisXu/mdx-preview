@@ -186,6 +186,47 @@ function load_more(done) {
     load_at(state.base + state.items.length, done);
 }
 
+function prepend_rows(items) {
+    var frag = document.createDocumentFragment();
+    items.forEach(function (item) {
+        var row = document.createElement('div');
+        row.className = 'word-row';
+        row.dataset.id = item[1];
+        row.appendChild(highlight(item[0]));
+        frag.appendChild(row);
+    });
+    els.list.insertBefore(frag, els.list.firstChild);
+    state.items = items.concat(state.items);
+}
+
+// Pull one page ending at the current base, so the list can grow upwards.
+function load_prev(done) {
+    if (state.loading || !rpc || state.base <= 0) { if (done) done(false, 0); return; }
+    state.loading = true;
+    var gen = state.gen;
+    var start = state.base;
+    var offset = Math.max(0, start - 20);
+    var want = start - offset;
+    var query = state.query;
+    var desc = state.desc;
+    var old_height = els.list.scrollHeight;
+    rpc(function (result) {
+        if (gen !== state.gen) { if (done) done(false, 0); return; }
+        state.loading = false;
+        var items = ((result && result.items) || []).slice(0, want);
+        if (!items.length) { if (done) done(false, 0); return; }
+        prepend_rows(items);
+        state.base = offset;
+        state.selected = state.selected < 0 ? -1 : state.selected + items.length;
+        var rows = els.list.children;
+        for (var i = 0; i < rows.length; i++) {
+            rows[i].classList.toggle('active', i === state.selected);
+        }
+        els.list.scrollTop += els.list.scrollHeight - old_height;
+        if (done) done(true, items.length);
+    }, 'suggest_words', query, offset, desc);
+}
+
 function search(query) {
     state.query = query;
     state.base = 0;
@@ -280,9 +321,23 @@ function move_active(delta) {
     if (!rows.length) return;
     var from = state.selected < 0 ? 0 : state.selected;
     var next = from + delta;
-    if (next < 0) next = 0;
-    if (next > rows.length - 1 && state.hasMore) {
+    if (next < 0) {
+        // PgUp above the first loaded row: pull the page before it.
+        if (state.base > 0) {
+            load_prev(function (ok, added) {
+                set_active(ok ? Math.max(0, from + added + delta) : 0);
+            });
+        } else {
+            set_active(0);
+        }
+        return;
+    }
+    if (next > rows.length - 1) {
         // PgDn/End past the loaded rows: pull one more page, then keep moving.
+        if (!state.hasMore) {
+            set_active(rows.length - 1);
+            return;
+        }
         var overflow = next - (rows.length - 1);
         var at = rows.length;
         load_more(function (ok) {
@@ -292,7 +347,9 @@ function move_active(delta) {
         });
         return;
     }
-    set_active(Math.min(next, rows.length - 1));
+    set_active(next);
+    // Keep a page of history above the selection so PgUp never hits a wall.
+    if (state.base > 0 && next <= 3) load_prev();
 }
 
 function pick_active() {
@@ -434,6 +491,8 @@ function bind_events() {
     els.list.addEventListener('scroll', function () {
         if (els.list.scrollTop + els.list.clientHeight >= els.list.scrollHeight - 48) {
             load_more();
+        } else if (els.list.scrollTop <= 4) {
+            load_prev();
         }
     });
 

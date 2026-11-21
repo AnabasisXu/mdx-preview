@@ -811,7 +811,7 @@ impl Dict {
 /// First-character jump bar. ASCII letters/digits get one bucket each; other
 /// scripts (CJK, kana, ...) are sampled down so the strip stays usable.
 fn build_initials(words: &[String]) -> Vec<(String, usize, usize)> {
-    let mut map: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut map: HashMap<String, (usize, usize, usize)> = HashMap::new();
     for (i, word) in words.iter().enumerate() {
         let Some(first) = word.chars().next() else {
             continue;
@@ -822,12 +822,17 @@ fn build_initials(words: &[String]) -> Vec<(String, usize, usize)> {
             first.to_string()
         };
         map.entry(label)
-            .and_modify(|(_, last)| *last = i)
-            .or_insert((i, i));
+            .and_modify(|(_, last, count)| {
+                *last = i;
+                *count += 1;
+            })
+            .or_insert((i, i, 1));
     }
+    // A bucket with a single headword is a dead end, so drop it.
     let (mut ascii, mut other): (Vec<_>, Vec<_>) = map
         .into_iter()
-        .map(|(label, (first, last))| (label, first, last))
+        .filter(|(_, (_, _, count))| *count > 1)
+        .map(|(label, (first, last, _))| (label, first, last))
         .partition(|(label, _, _)| label.chars().all(|c| c.is_ascii_alphanumeric()));
     ascii.sort_by(|a, b| a.0.cmp(&b.0));
     other.sort_by_key(|(_, first, _)| *first);

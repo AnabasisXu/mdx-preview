@@ -8,8 +8,10 @@
 
 use actix_web::{get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_ws::Message;
+use encoding_rs::Encoding;
 use flate2::read::ZlibDecoder;
 use futures_util::StreamExt;
+use ripemd::{Digest, Ripemd128};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -68,12 +70,41 @@ fn unzlib(data: &[u8]) -> io::Result<Vec<u8>> {
     ZlibDecoder::new(data).read_to_end(&mut out)?;
     Ok(out)
 }
+
+/// MDict `Encrypted=2` obfuscates the key block info with a rolling XOR whose
+/// key is derived from the block's adler32 field. Reverse-engineered scheme;
+/// see readmdict's `_mdx_decrypt`.
+fn mdx_decrypt(block: &[u8]) -> Vec<u8> {
+    let mut out = block.to_vec();
+    if out.len() <= 8 {
+        return out;
+    }
+    let mut hasher = Ripemd128::new();
+    hasher.update(&block[4..8]);
+    hasher.update(0x3695u32.to_le_bytes());
+    let key = hasher.finalize();
+    let mut previous = 0x36u8;
+    for (i, &b) in block[8..].iter().enumerate() {
+        out[8 + i] = b.rotate_left(4) ^ previous ^ (i as u8) ^ key[i % key.len()];
+        previous = b;
+    }
+    out
+}
 fn utf16le(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     String::from_utf16_lossy(&units)
+}
+
+/// Decode record/key bytes with the encoding declared in the container header.
+/// `None` means the caller already handles UTF-16.
+fn decode(bytes: &[u8], codec: Option<&'static Encoding>) -> String {
+    match codec {
+        Some(enc) => enc.decode(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
 }
 
 fn parse_header(text: &str) -> HashMap<String, String> {
@@ -133,6 +164,19 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2.0);
     let width = if version >= 2.0 { 8 } else { 4 };
+    // 0 = plain, 1 = passcode-protected key numbers, 2 = obfuscated key block
+    // info, 3 = both. Only the bit-2 scheme is reversible without a passcode.
+    let encrypt = match h.get("Encrypted").map(String::as_str).unwrap_or("No") {
+        "Yes" => 1,
+        "No" | "" => 0,
+        other => other.parse::<u32>().unwrap_or(0),
+    };
+    if encrypt & 1 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dictionary is passcode-protected (Encrypted=1/3), which is not supported",
+        ));
+    }
 
     let mut p = 4 + hlen;
     if version >= 2.0 {
@@ -153,12 +197,22 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
     let kb_info_raw = &d[p..p + kb_info_size];
     p += kb_info_size;
     let kb_info = if version >= 2.0 {
-        unzlib(&kb_info_raw[8..])?
+        let block = if encrypt & 2 != 0 {
+            mdx_decrypt(kb_info_raw)
+        } else {
+            kb_info_raw.to_vec()
+        };
+        unzlib(&block[8..])?
     } else {
         kb_info_raw.to_vec()
     };
 
     let is_utf16 = encoding.eq_ignore_ascii_case("UTF-16");
+    let codec = if is_utf16 {
+        None
+    } else {
+        Encoding::for_label(encoding.as_bytes())
+    };
 
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -233,7 +287,7 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
                 while k < block.len() && block[k] != 0 {
                     k += 1;
                 }
-                word = String::from_utf8_lossy(&block[start..k]).to_string();
+                word = decode(&block[start..k], codec);
                 j = k + 1;
             }
             keys.push((key_id, word));
@@ -279,9 +333,12 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
         } else {
             stream.len()
         };
-        let text = String::from_utf8_lossy(&stream[start.min(stream.len())..end.min(stream.len())])
-            .trim_end_matches('\0')
-            .to_string();
+        let text = decode(
+            &stream[start.min(stream.len())..end.min(stream.len())],
+            codec,
+        )
+        .trim_end_matches('\0')
+        .to_string();
         out.push((keys[idx].1.clone(), text));
     }
     resolve_links(&mut out);

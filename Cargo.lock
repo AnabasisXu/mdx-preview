@@ -838,6 +838,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "futures-util",
+ "percent-encoding",
  "ripemd",
  "serde_json",
  "tokio",

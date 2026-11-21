@@ -4,6 +4,8 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Relative image/CSS references resolve into the .mdd resource route. -->
+    <base href="{base}/api/res/" />
     <style>
         html,
         body {
@@ -105,6 +107,18 @@
             window.addEventListener('message', function (e) {
                 var d = e.data;
                 if (d && d.type === 'zoom' && typeof d.value === 'number') apply(d.value);
+            });
+            // <base> would otherwise send in-page anchors to the resource route.
+            document.addEventListener('click', function (e) {
+                var a = e.target && e.target.closest ? e.target.closest('a') : null;
+                if (!a) return;
+                var href = a.getAttribute('href') || '';
+                if (href.charAt(0) !== '#') return;
+                var target = document.getElementById(href.slice(1));
+                if (target) {
+                    e.preventDefault();
+                    target.scrollIntoView();
+                }
             });
             try { parent.postMessage({ type: 'ready' }, '*'); } catch (err) { }
         })();

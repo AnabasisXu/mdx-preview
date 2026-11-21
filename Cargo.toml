@@ -16,3 +16,4 @@ tokio = { version = "1", features = ["sync"] }
 flate2 = "1"
 ripemd = "0.1"
 encoding_rs = "0.8"
+percent-encoding = "2"

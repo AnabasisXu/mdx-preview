@@ -15,7 +15,9 @@ use ripemd::{Digest, Ripemd128};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
@@ -381,6 +383,300 @@ fn resolve_links(entries: &mut [(String, String)]) {
     }
 }
 
+// ---------------------------------------------------------------- MDD reader
+
+/// One compressed record block inside an .mdd: file offset + sizes.
+struct MddBlock {
+    offset: u64,
+    comp: usize,
+    decomp: usize,
+}
+
+/// .mdd resource archive: keys are UTF-16 paths ("\dir\file.ext"), records are
+/// raw file bytes. Index only; blocks are decompressed on demand.
+struct Mdd {
+    path: PathBuf,
+    blocks: Vec<MddBlock>,
+    files: HashMap<String, (usize, usize)>,
+}
+
+impl Mdd {
+    fn read_block(&self, f: &mut File, b: &MddBlock) -> io::Result<Vec<u8>> {
+        f.seek(SeekFrom::Start(b.offset))?;
+        let mut buf = vec![0u8; b.comp];
+        f.read_exact(&mut buf)?;
+        match le_u32(&buf, 0) {
+            0 => Ok(buf[8..].to_vec()),
+            2 => unzlib(&buf[8..]),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LZO compression is not supported",
+            )),
+        }
+    }
+
+    fn read(&self, start: usize, end: usize) -> io::Result<Vec<u8>> {
+        let mut f = File::open(&self.path)?;
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        let mut base = 0usize;
+        for b in &self.blocks {
+            let bend = base + b.decomp;
+            if bend <= start {
+                base = bend;
+                continue;
+            }
+            if base >= end {
+                break;
+            }
+            let block = self.read_block(&mut f, b)?;
+            let lo = start.saturating_sub(base);
+            let hi = (end - base).min(block.len());
+            if lo < hi {
+                out.extend_from_slice(&block[lo..hi]);
+            }
+            base = bend;
+        }
+        Ok(out)
+    }
+}
+
+fn read_exact_at(f: &mut File, n: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_fnum(f: &mut File, width: usize) -> io::Result<u64> {
+    let raw = read_exact_at(f, width)?;
+    Ok(if width == 8 {
+        be_u64(&raw, 0)
+    } else {
+        be_u32(&raw, 0) as u64
+    })
+}
+
+/// MDD keys use `\dir\file.ext`, URLs use `/dir/file.ext`; compare case-insensitively.
+fn norm_res(path: &str) -> String {
+    path.trim_start_matches(['/', '\\'])
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn load_mdd(path: &Path) -> io::Result<Mdd> {
+    let mut f = File::open(path)?;
+    let hlen = be_u32(&read_exact_at(&mut f, 4)?, 0) as usize;
+    let header = utf16le(&read_exact_at(&mut f, hlen)?);
+    let h = parse_header(&header);
+    let version: f32 = h
+        .get("GeneratedByEngineVersion")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.0);
+    let width = if version >= 2.0 { 8 } else { 4 };
+    let term = if version >= 2.0 { 1 } else { 0 };
+    let encrypt = match h.get("Encrypted").map(String::as_str).unwrap_or("No") {
+        "Yes" => 1,
+        "No" | "" => 0,
+        other => other.parse::<u32>().unwrap_or(0),
+    };
+    if encrypt & 1 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "passcode-protected (Encrypted=1/3)",
+        ));
+    }
+
+    if version >= 2.0 {
+        read_exact_at(&mut f, 4)?; // adler32 of the header text
+    }
+    let num_key_blocks = read_fnum(&mut f, width)?;
+    read_fnum(&mut f, width)?; // number of entries
+    if version >= 2.0 {
+        read_fnum(&mut f, width)?; // decompressed size of key block info
+    }
+    let kb_info_size = read_fnum(&mut f, width)? as usize;
+    let kb_size = read_fnum(&mut f, width)? as usize;
+    if version >= 2.0 {
+        read_exact_at(&mut f, 4)?; // adler32 of the five numbers
+    }
+
+    let mut kb_info = read_exact_at(&mut f, kb_info_size)?;
+    if version >= 2.0 {
+        if encrypt & 2 != 0 {
+            kb_info = mdx_decrypt(&kb_info);
+        }
+        kb_info = unzlib(&kb_info[8..])?;
+    }
+
+    let mut sizes: Vec<(usize, usize)> = Vec::with_capacity(num_key_blocks as usize);
+    let mut i = 0;
+    while i < kb_info.len() {
+        read_num(&kb_info, &mut i, width); // entries in this key block
+        let hs = if version >= 2.0 {
+            let s = be_u16(&kb_info, i) as usize;
+            i += 2;
+            s
+        } else {
+            let s = kb_info[i] as usize;
+            i += 1;
+            s
+        };
+        i += (hs + term) * 2;
+        let ts = if version >= 2.0 {
+            let s = be_u16(&kb_info, i) as usize;
+            i += 2;
+            s
+        } else {
+            let s = kb_info[i] as usize;
+            i += 1;
+            s
+        };
+        i += (ts + term) * 2;
+        let comp = read_num(&kb_info, &mut i, width) as usize;
+        let decomp = read_num(&kb_info, &mut i, width) as usize;
+        sizes.push((comp, decomp));
+    }
+
+    let kb = read_exact_at(&mut f, kb_size)?;
+    let mut keys: Vec<(usize, String)> = Vec::new();
+    let mut off = 0;
+    for (comp, _) in &sizes {
+        let kind = le_u32(&kb, off);
+        let body = &kb[off + 8..off + comp];
+        let block = match kind {
+            0 => body.to_vec(),
+            2 => unzlib(body)?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "LZO compression is not supported",
+                ))
+            }
+        };
+        let mut j = 0;
+        while j < block.len() {
+            let key_id = read_num(&block, &mut j, width) as usize;
+            let start = j;
+            let mut k = j;
+            while k + 1 < block.len() && !(block[k] == 0 && block[k + 1] == 0) {
+                k += 2;
+            }
+            // MDD keys are always UTF-16LE, whatever the header claims.
+            keys.push((key_id, norm_res(&utf16le(&block[start..k]))));
+            j = k + 2;
+        }
+        off += comp;
+    }
+
+    // --- record section: block directory first, then a lazy offset list.
+    let num_record_blocks = read_fnum(&mut f, width)?;
+    read_fnum(&mut f, width)?; // number of entries
+    read_fnum(&mut f, width)?; // size of record block info
+    read_fnum(&mut f, width)?; // size of record blocks
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(num_record_blocks as usize);
+    for _ in 0..num_record_blocks {
+        let comp = read_fnum(&mut f, width)? as usize;
+        let decomp = read_fnum(&mut f, width)? as usize;
+        pairs.push((comp, decomp));
+    }
+    let mut offset = f.stream_position()?;
+    let mut blocks = Vec::with_capacity(pairs.len());
+    for (comp, decomp) in pairs {
+        blocks.push(MddBlock {
+            offset,
+            comp,
+            decomp,
+        });
+        offset += comp as u64;
+    }
+
+    keys.sort_by_key(|(start, _)| *start);
+    let total: usize = blocks.iter().map(|b| b.decomp).sum();
+    let mut files = HashMap::with_capacity(keys.len());
+    for idx in 0..keys.len() {
+        let (start, ref name) = keys[idx];
+        let end = if idx + 1 < keys.len() {
+            keys[idx + 1].0
+        } else {
+            total
+        };
+        if start < end {
+            files.entry(name.clone()).or_insert((start, end));
+        }
+    }
+
+    Ok(Mdd {
+        path: path.to_path_buf(),
+        blocks,
+        files,
+    })
+}
+
+/// `dict.mdx` owns `dict.mdd` plus optional `dict.1.mdd`, `dict.2.mdd`, ...
+fn mdd_candidates(mdx: &str) -> Vec<PathBuf> {
+    let p = Path::new(mdx);
+    let dir = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let stem = match p.file_stem() {
+        Some(s) => s.to_string_lossy().to_lowercase(),
+        None => return Vec::new(),
+    };
+    let (mut plain, mut numbered) = (None, Vec::new());
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lower = name.to_lowercase();
+            let Some(base) = lower.strip_suffix(".mdd") else {
+                continue;
+            };
+            if base == stem {
+                plain = Some(path);
+            } else if let Some(rest) = base.strip_prefix(&format!("{stem}.")) {
+                if let Ok(n) = rest.parse::<u64>() {
+                    numbered.push((n, path));
+                }
+            }
+        }
+    }
+    numbered.sort_by_key(|(n, _)| *n);
+    let mut out = Vec::new();
+    if let Some(p) = plain {
+        out.push(p);
+    }
+    out.extend(numbered.into_iter().map(|(_, p)| p));
+    out
+}
+
+struct Resource {
+    mdd: usize,
+    start: usize,
+    end: usize,
+}
+
+fn load_resources(mdx: &str) -> (Vec<Mdd>, HashMap<String, Resource>) {
+    let mut mdds = Vec::new();
+    let mut map = HashMap::new();
+    for path in mdd_candidates(mdx) {
+        match load_mdd(&path) {
+            Ok(mdd) => {
+                let idx = mdds.len();
+                for (key, (start, end)) in &mdd.files {
+                    map.entry(key.clone()).or_insert(Resource {
+                        mdd: idx,
+                        start: *start,
+                        end: *end,
+                    });
+                }
+                mdds.push(mdd);
+            }
+            Err(e) => eprintln!("prev: skipping {}: {e}", path.display()),
+        }
+    }
+    (mdds, map)
+}
+
 // ---------------------------------------------------------------- web layer
 
 struct Dict {
@@ -416,6 +712,8 @@ impl Dict {
 
 struct AppState {
     dict: Arc<Dict>,
+    mdds: Vec<Mdd>,
+    res: HashMap<String, Resource>,
     tx: broadcast::Sender<String>,
 }
 
@@ -440,6 +738,7 @@ fn routes(cfg: &mut web::ServiceConfig) {
         .service(item)
         .service(lookup)
         .service(static_file)
+        .service(res_file)
         .service(dist)
         .service(favicon)
         .service(ws);
@@ -453,6 +752,7 @@ fn root(cfg: &mut web::ServiceConfig) {
 
 fn render_item(title: &str, body_html: &str) -> String {
     ITEM_HTML
+        .replace("{base}", base())
         .replace("{title}", title)
         .replace("{attributes}", body_html)
 }
@@ -502,6 +802,41 @@ async fn static_file(path: web::Path<String>) -> impl Responder {
     }
 }
 
+fn serve_resource(rel: &str, state: &AppState) -> HttpResponse {
+    if rel.is_empty() || rel.contains("..") {
+        return HttpResponse::NotFound().body("NOT_FOUND");
+    }
+    let key = norm_res(rel);
+    let Some(res) = state.res.get(&key) else {
+        return HttpResponse::NotFound().body("NOT_FOUND");
+    };
+    match state.mdds[res.mdd].read(res.start, res.end) {
+        Ok(bytes) => HttpResponse::Ok()
+            .content_type(mime_of(&key))
+            .insert_header(("Cache-Control", "public, max-age=3600"))
+            .body(bytes),
+        Err(e) => HttpResponse::InternalServerError().body(format!("READ_ERROR: {e}")),
+    }
+}
+
+#[get("/api/res/{path:.*}")]
+async fn res_file(path: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
+    serve_resource(&path.into_inner(), &state)
+}
+
+/// Entries also reference resources with root-absolute paths (`/img.png`);
+/// anything no other route claimed is looked up in the .mdd archives.
+async fn fallback(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    let decoded = percent_encoding::percent_decode_str(req.path()).decode_utf8_lossy();
+    let mut rel = decoded.as_ref();
+    if !base().is_empty() {
+        if let Some(rest) = rel.strip_prefix(base()) {
+            rel = rest;
+        }
+    }
+    serve_resource(rel, &state)
+}
+
 #[get("/dist/{path:.*}")]
 async fn dist(path: web::Path<String>) -> impl Responder {
     match path.into_inner().as_str() {
@@ -522,10 +857,25 @@ async fn favicon() -> impl Responder {
 
 fn mime_of(name: &str) -> &'static str {
     match name.rsplit('.').next() {
-        Some("html") => "text/html; charset=utf-8",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("pdf") => "application/pdf",
         _ => "application/octet-stream",
     }
 }
@@ -652,16 +1002,30 @@ async fn main() -> std::io::Result<()> {
         texts,
         encoding,
     });
+    let (mdds, res) = load_resources(&file);
     let (tx, _rx) = broadcast::channel(32);
-    let state = web::Data::new(AppState { dict, tx });
+    let state = web::Data::new(AppState {
+        dict,
+        mdds,
+        res,
+        tx,
+    });
 
     println!("prev: {count} headwords from {file}");
+    if !state.res.is_empty() {
+        println!(
+            "prev: {} resources from {} mdd file(s)",
+            state.res.len(),
+            state.mdds.len()
+        );
+    }
     println!("listening on http://127.0.0.1:{port}{base}/");
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .configure(root)
             .service(web::scope(base.as_str()).configure(routes))
+            .default_service(web::to(fallback))
     })
     .bind(("127.0.0.1", port))?
     .run()

@@ -21,8 +21,6 @@ const INDEX_HTML: &str = include_str!("static/index.html");
 const ITEM_HTML: &str = include_str!("static/item.html");
 const SITE_CSS: &str = include_str!("static/site.css");
 const UTILS_JS: &str = include_str!("static/utils.js");
-const JQUERY_JS: &str = include_str!("static/jquery.min.js");
-const AUTOCOMPLETE_JS: &str = include_str!("static/autocomplete.min.js");
 
 // Public mount prefix, e.g. "/mdx-preview"; empty means site root.
 static BASE: OnceLock<String> = OnceLock::new();
@@ -364,12 +362,6 @@ struct AppState {
     tx: broadcast::Sender<String>,
 }
 
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 #[get("/")]
 async fn index_page() -> impl Responder {
     HttpResponse::Ok()
@@ -387,7 +379,6 @@ async fn root_redirect() -> impl Responder {
 
 fn routes(cfg: &mut web::ServiceConfig) {
     cfg.service(index_page)
-        .service(welcome)
         .service(parser)
         .service(item)
         .service(lookup)
@@ -403,32 +394,10 @@ fn root(cfg: &mut web::ServiceConfig) {
     }
 }
 
-fn render_item(title: &str, body_html: &str, state: &AppState) -> String {
+fn render_item(title: &str, body_html: &str) -> String {
     ITEM_HTML
         .replace("{title}", title)
         .replace("{attributes}", body_html)
-        .replace("{encoding}", &state.dict.encoding)
-        .replace("{count}", &state.dict.words.len().to_string())
-}
-
-#[get("/api/welcome")]
-async fn welcome(state: web::Data<AppState>) -> impl Responder {
-    // Keep the initial document bounded; the search dropdown loads later pages on scroll.
-    let mut html =
-        String::from("<div style=\"font-weight:normal;line-height:1.9;column-width:190px;\">");
-    for (word, id) in state.dict.words.iter().take(20) {
-        html.push_str(&format!(
-            "<a style=\"display:block;color:#276AAD;text-decoration:none;\" \
-             href=\"{}/api/item/{}\">{}</a>",
-            base(),
-            id,
-            esc(word)
-        ));
-    }
-    html.push_str("</div>");
-    HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(html)
 }
 
 #[get("/api/parser")]
@@ -453,7 +422,7 @@ async fn item(k_id: web::Path<u32>, state: web::Data<AppState>) -> impl Responde
                 .unwrap_or("");
             HttpResponse::Ok()
                 .content_type("text/html; charset=utf-8")
-                .body(render_item(title, text, &state))
+                .body(render_item(title, text))
         }
         None => HttpResponse::NotFound().body("404"),
     }
@@ -485,12 +454,6 @@ async fn dist(path: web::Path<String>) -> impl Responder {
         "utils.js" => HttpResponse::Ok()
             .content_type("application/javascript; charset=utf-8")
             .body(rebase(UTILS_JS)),
-        "jquery.min.js" => HttpResponse::Ok()
-            .content_type("application/javascript; charset=utf-8")
-            .body(JQUERY_JS),
-        "autocomplete.min.js" => HttpResponse::Ok()
-            .content_type("application/javascript; charset=utf-8")
-            .body(AUTOCOMPLETE_JS),
         _ => HttpResponse::NotFound().body("FILE_NOT_FOUND"),
     }
 }

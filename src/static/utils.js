@@ -159,17 +159,21 @@ function append_rows(items) {
     state.items = state.items.concat(items);
 }
 
-function load_at(offset) {
-    if (state.loading || !rpc) return;
+function load_at(offset, done) {
+    if (state.loading || !rpc) { if (done) done(false); return; }
     state.loading = true;
     var gen = state.gen;
     var query = state.query;
     var desc = state.desc;
     rpc(function (result, err) {
-        if (gen !== state.gen) return; // stale reply after a new search/jump
+        if (gen !== state.gen) { // stale reply after a new search/jump
+            if (done) done(false);
+            return;
+        }
         state.loading = false;
         append_rows((result && result.items) || []);
         state.hasMore = !!(result && result.has_more);
+        if (done) done(true);
         // Short page and no scrollbar: the scroll event can never fire.
         if (state.hasMore && els.list.scrollHeight <= els.list.clientHeight + 8) {
             load_more();
@@ -177,9 +181,9 @@ function load_at(offset) {
     }, 'suggest_words', query, offset, desc);
 }
 
-function load_more() {
-    if (!state.hasMore || state.loading) return;
-    load_at(state.base + state.items.length);
+function load_more(done) {
+    if (!state.hasMore || state.loading) { if (done) done(false); return; }
+    load_at(state.base + state.items.length, done);
 }
 
 function search(query) {
@@ -272,10 +276,23 @@ function set_active(index) {
 }
 
 function move_active(delta) {
-    if (!els.list.children.length) return;
-    var next = state.selected < 0 ? 0 : state.selected + delta;
+    var rows = els.list.children;
+    if (!rows.length) return;
+    var from = state.selected < 0 ? 0 : state.selected;
+    var next = from + delta;
     if (next < 0) next = 0;
-    set_active(next);
+    if (next > rows.length - 1 && state.hasMore) {
+        // PgDn/End past the loaded rows: pull one more page, then keep moving.
+        var overflow = next - (rows.length - 1);
+        var at = rows.length;
+        load_more(function (ok) {
+            if (!ok) return;
+            var grown = els.list.children.length;
+            if (grown > at) set_active(Math.min(grown - 1, at - 1 + overflow));
+        });
+        return;
+    }
+    set_active(Math.min(next, rows.length - 1));
 }
 
 function pick_active() {

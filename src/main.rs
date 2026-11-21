@@ -11,6 +11,7 @@ use actix_ws::Message;
 use encoding_rs::Encoding;
 use flate2::read::ZlibDecoder;
 use futures_util::StreamExt;
+use memmap2::Mmap;
 use ripemd::{Digest, Ripemd128};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -151,9 +152,109 @@ fn read_num(d: &[u8], p: &mut usize, width: usize) -> u64 {
     v
 }
 
-/// Parse an .mdx container into (headword, entry HTML) pairs, in file order.
-fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
-    let d = fs::read(path)?;
+struct RecordBlock {
+    offset: usize,
+    comp: usize,
+    decomp: usize,
+}
+
+/// Memory-mapped .mdx with lazy record decompression. Keeping only the map and
+/// the key index makes resident memory track the file size instead of the much
+/// larger decompressed text.
+struct Mdx {
+    map: Mmap,
+    blocks: Vec<RecordBlock>,
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    words: Vec<String>,
+    /// Entry ids sorted by headword, for `@@@LINK=` lookups.
+    sorted: Vec<u32>,
+    encoding: String,
+    codec: Option<&'static Encoding>,
+}
+
+impl Mdx {
+    fn decompress(&self, b: &RecordBlock) -> io::Result<Vec<u8>> {
+        let buf = &self.map[b.offset..b.offset + b.comp];
+        match le_u32(buf, 0) {
+            0 => Ok(buf[8..].to_vec()),
+            2 => unzlib(&buf[8..]),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LZO compression is not supported",
+            )),
+        }
+    }
+
+    fn raw(&self, start: usize, end: usize) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        let mut base = 0usize;
+        for b in &self.blocks {
+            let bend = base + b.decomp;
+            if bend <= start {
+                base = bend;
+                continue;
+            }
+            if base >= end {
+                break;
+            }
+            let block = self.decompress(b)?;
+            let lo = start.saturating_sub(base);
+            let hi = (end - base).min(block.len());
+            if lo < hi {
+                out.extend_from_slice(&block[lo..hi]);
+            }
+            base = bend;
+        }
+        Ok(out)
+    }
+
+    fn text_at(&self, idx: usize) -> Option<String> {
+        let start = *self.starts.get(idx)? as usize;
+        let end = *self.ends.get(idx)? as usize;
+        let raw = self.raw(start, end).ok()?;
+        let text = decode(&raw, self.codec);
+        Some(text.trim_end_matches('\0').to_string())
+    }
+
+    /// Entry text with `@@@LINK=` redirects followed (bounded, cycle-safe).
+    fn text(&self, id: u32) -> Option<String> {
+        let idx = (id as usize).checked_sub(1)?;
+        let mut cur = idx;
+        for _ in 0..16 {
+            let text = self.text_at(cur)?;
+            let Some(target) = text.trim().strip_prefix("@@@LINK=") else {
+                return Some(text);
+            };
+            let target = target.trim();
+            match self.find(target) {
+                Some(next) if next != cur => cur = next,
+                _ => return Some(text),
+            }
+        }
+        self.text_at(idx)
+    }
+
+    fn find(&self, word: &str) -> Option<usize> {
+        self.sorted
+            .binary_search_by(|id| self.words[*id as usize].as_str().cmp(word))
+            .ok()
+            .map(|pos| self.sorted[pos] as usize)
+    }
+
+    fn word(&self, id: u32) -> Option<&str> {
+        (id as usize)
+            .checked_sub(1)
+            .and_then(|i| self.words.get(i))
+            .map(String::as_str)
+    }
+}
+
+/// Parse an .mdx container into an index plus its record blocks.
+fn load_mdx(path: &str) -> io::Result<Mdx> {
+    let file = File::open(path)?;
+    let map = unsafe { Mmap::map(&file)? };
+    let d: &[u8] = &map;
     if d.len() < 8 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
     }
@@ -309,84 +410,44 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
         info.push((comp, decomp));
     }
 
-    let mut stream: Vec<u8> = Vec::new();
-    for (comp, _decomp) in &info {
-        let kind = le_u32(&d, p);
-        let body = &d[p + 8..p + comp];
-        let block = match kind {
-            0 => body.to_vec(),
-            2 => unzlib(body)?,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "LZO compression is not supported",
-                ))
-            }
-        };
-        stream.extend_from_slice(&block);
-        p += comp;
+    let mut blocks = Vec::with_capacity(info.len());
+    let mut offset = p;
+    for (comp, decomp) in info {
+        blocks.push(RecordBlock {
+            offset,
+            comp,
+            decomp,
+        });
+        offset += comp;
     }
+    let total: u64 = blocks.iter().map(|b| b.decomp as u64).sum();
 
-    let mut out = Vec::with_capacity(keys.len());
+    let mut starts = Vec::with_capacity(keys.len());
+    let mut ends = Vec::with_capacity(keys.len());
     for idx in 0..keys.len() {
-        let start = keys[idx].0 as usize;
-        let end = if idx + 1 < keys.len() {
-            keys[idx + 1].0 as usize
+        starts.push(keys[idx].0);
+        ends.push(if idx + 1 < keys.len() {
+            keys[idx + 1].0
         } else {
-            stream.len()
-        };
-        let text = decode(
-            &stream[start.min(stream.len())..end.min(stream.len())],
-            codec,
-        )
-        .trim_end_matches('\0')
-        .to_string();
-        out.push((keys[idx].1.clone(), text));
+            total
+        });
     }
-    resolve_links(&mut out);
-    Ok((out, encoding))
-}
-
-/// MDict redirect entries carry no content of their own: their body is
-/// `@@@LINK=other headword`. Show the target entry instead of the raw marker.
-fn resolve_links(entries: &mut [(String, String)]) {
-    let mut index: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
-    for (i, (word, _)) in entries.iter().enumerate() {
-        index.entry(word.as_str()).or_insert(i);
+    let mut words = Vec::with_capacity(keys.len());
+    for (_, word) in keys {
+        words.push(word);
     }
-    let link: Vec<Option<usize>> = entries
-        .iter()
-        .map(|(_, text)| {
-            text.trim()
-                .strip_prefix("@@@LINK=")
-                .map(str::trim)
-                .and_then(|name| index.get(name).copied())
-        })
-        .collect();
-    let targets: Vec<Option<usize>> = (0..entries.len())
-        .map(|i| {
-            let (mut cur, mut hops) = (i, 0);
-            loop {
-                match link[cur] {
-                    Some(j) if j == i || hops == 16 => return None, // cycle
-                    Some(j) => {
-                        cur = j;
-                        hops += 1;
-                    }
-                    None => return Some(cur),
-                }
-            }
-        })
-        .collect();
-    // Only redirect entries pay for a copy; plain entries are left untouched.
-    for (i, target) in targets.into_iter().enumerate() {
-        if let Some(t) = target {
-            if t != i {
-                let text = entries[t].1.clone();
-                entries[i].1 = text;
-            }
-        }
-    }
+    let mut sorted: Vec<u32> = (0..words.len() as u32).collect();
+    sorted.sort_by(|a, b| words[*a as usize].cmp(&words[*b as usize]));
+    Ok(Mdx {
+        map,
+        blocks,
+        starts,
+        ends,
+        words,
+        sorted,
+        encoding,
+        codec,
+    })
 }
 
 // ---------------------------------------------------------------- MDD reader
@@ -686,12 +747,10 @@ fn load_resources(mdx: &str) -> (Vec<Mdd>, HashMap<String, Resource>) {
 // ---------------------------------------------------------------- web layer
 
 struct Dict {
-    /// Display headwords in file order; a word's id is its index + 1.
-    words: Vec<String>,
+    /// Headwords live in the mapped file's index; a word's id is its index + 1.
+    mdx: Mdx,
     /// Lowercased headwords, computed once so filtering never allocates per word.
     lower: Vec<String>,
-    texts: Vec<String>,
-    encoding: String,
     /// Jump bar buckets: (label, first index, last index) in file order.
     initials: Vec<(String, usize, usize)>,
 }
@@ -716,7 +775,7 @@ impl Dict {
                 continue;
             }
             if items.len() < limit {
-                items.push((self.words[i].clone(), (i + 1) as u32));
+                items.push((self.mdx.words[i].clone(), (i + 1) as u32));
             } else {
                 has_more = true;
                 break;
@@ -734,24 +793,18 @@ impl Dict {
     ) -> (Vec<(String, u32)>, bool) {
         let q = q.to_lowercase();
         if desc {
-            self.page((0..self.words.len()).rev(), &q, offset, limit)
+            self.page((0..self.mdx.words.len()).rev(), &q, offset, limit)
         } else {
-            self.page(0..self.words.len(), &q, offset, limit)
+            self.page(0..self.mdx.words.len(), &q, offset, limit)
         }
     }
 
     fn word(&self, id: u32) -> Option<&str> {
-        (id as usize)
-            .checked_sub(1)
-            .and_then(|i| self.words.get(i))
-            .map(String::as_str)
+        self.mdx.word(id)
     }
 
-    fn text(&self, id: u32) -> Option<&str> {
-        (id as usize)
-            .checked_sub(1)
-            .and_then(|i| self.texts.get(i))
-            .map(String::as_str)
+    fn text(&self, id: u32) -> Option<String> {
+        self.mdx.text(id)
     }
 }
 
@@ -849,8 +902,8 @@ fn render_item(title: &str, body_html: &str) -> String {
 #[get("/api/parser")]
 async fn parser(state: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(json!({
-        "encoding": state.dict.encoding,
-        "count": state.dict.words.len(),
+        "encoding": state.dict.mdx.encoding,
+        "count": state.dict.mdx.words.len(),
     }))
 }
 
@@ -862,7 +915,7 @@ async fn item(k_id: web::Path<u32>, state: web::Data<AppState>) -> impl Responde
             let title = state.dict.word(k_id).unwrap_or("");
             HttpResponse::Ok()
                 .content_type("text/html; charset=utf-8")
-                .body(render_item(title, text))
+                .body(render_item(title, &text))
         }
         None => HttpResponse::NotFound().body("404"),
     }
@@ -1012,14 +1065,14 @@ async fn ws(
                         }
                         "load_text" => {
                             let k = params.get(0).and_then(|p| p.as_u64()).unwrap_or(0) as u32;
-                            let text = state2.dict.text(k).unwrap_or("").to_string();
+                            let text = state2.dict.text(k).unwrap_or_default();
                             json!({"id": id, "result": text, "error": null})
                         }
                         "random" => {
-                            let n = state2.dict.words.len();
+                            let n = state2.dict.mdx.words.len();
                             let i = rand_index(n);
                             json!({"id": id, "result": {
-                                "word": state2.dict.words[i],
+                                "word": state2.dict.mdx.words[i],
                                 "k_id": (i + 1) as u32,
                             }, "error": null})
                         }
@@ -1032,7 +1085,7 @@ async fn ws(
                                 .get(1)
                                 .and_then(|p| p.as_bool())
                                 .unwrap_or(false);
-                            let n = state2.dict.words.len();
+                            let n = state2.dict.mdx.words.len();
                             let offset = state2
                                 .dict
                                 .initials
@@ -1100,34 +1153,25 @@ async fn main() -> std::io::Result<()> {
     let file = file.unwrap_or_else(|| usage());
     let base = normalize_base(&base);
 
-    let (entries, encoding) = match load_mdx(&file) {
+    let mdx = match load_mdx(&file) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("prev: cannot read {file}: {e}");
             std::process::exit(1);
         }
     };
-    if entries.is_empty() {
+    if mdx.words.is_empty() {
         eprintln!("prev: no entries in {file}");
         std::process::exit(1);
     }
-    let count = entries.len();
-    let mut words = Vec::with_capacity(count);
-    let mut lower = Vec::with_capacity(count);
-    let mut texts = Vec::with_capacity(count);
-    for (word, text) in entries {
-        lower.push(word.to_lowercase());
-        words.push(word);
-        texts.push(text);
-    }
-    let initials = build_initials(&words);
+    let count = mdx.words.len();
+    let lower: Vec<String> = mdx.words.iter().map(|w| w.to_lowercase()).collect();
+    let initials = build_initials(&mdx.words);
     let _ = BASE.set(base.clone());
 
     let dict = Arc::new(Dict {
-        words,
+        mdx,
         lower,
-        texts,
-        encoding,
         initials,
     });
     let (mdds, res) = load_resources(&file);

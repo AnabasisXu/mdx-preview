@@ -6,15 +6,20 @@ var els = {};
 var conn = null;
 var rpc = null;
 
-// UI state: query text, rendered rows, paging and the selected row.
+// Sidebar state: current query, loaded rows, paging base/order, selection.
 var state = {
     query: '',
     items: [],
     hasMore: false,
     loading: false,
     selected: -1,
-    zoom: 1
+    base: 0,
+    desc: false,
+    gen: 0
 };
+
+// Visited entries, for Alt+Left / Alt+Right.
+var nav = { ids: [], pos: -1 };  // 'history' is a read-only window property
 
 var DEFAULT_WIDTH = 260;
 var MIN_WIDTH = 180;
@@ -90,22 +95,27 @@ function ajax_ws(path, callbacks) {
 }
 
 function bind_ws() {
-    var callbacks = {
+    rpc = ajax_ws('/api/v1/ws/', {
+        onopen: function () {
+            load_initials();
+            // The list may have been requested before the handshake finished;
+            // it is queued, but a reconnect needs the buckets refreshed.
+        },
         onclose: function () {
             log('disconnected.');
             setTimeout(bind_ws, 1000);
         },
         redirect: function (params) {
             log('redirect:', params[0]);
-            navigate(params[0]);
+            navigate(params[0], true);
         }
-    };
-    rpc = ajax_ws('/api/v1/ws/', callbacks);
+    });
 }
 
 // ------------------------------------------------------------------ results
 
 function clear_list() {
+    state.gen++;
     state.items = [];
     state.hasMore = false;
     state.loading = false;
@@ -149,38 +159,54 @@ function append_rows(items) {
     state.items = state.items.concat(items);
 }
 
-function request_page(offset) {
+function load_at(offset) {
     if (state.loading || !rpc) return;
     state.loading = true;
+    var gen = state.gen;
     var query = state.query;
+    var desc = state.desc;
     rpc(function (result, err) {
+        if (gen !== state.gen) return; // stale reply after a new search/jump
         state.loading = false;
-        if (query !== state.query) return; // stale reply
-        var items = (result && result.items) || [];
-        append_rows(items);
+        append_rows((result && result.items) || []);
         state.hasMore = !!(result && result.has_more);
         // Short page and no scrollbar: the scroll event can never fire.
         if (state.hasMore && els.list.scrollHeight <= els.list.clientHeight + 8) {
             load_more();
         }
-    }, 'suggest_words', query, offset);
-}
-
-function search(query) {
-    state.query = query;
-    clear_list();
-    request_page(0);
+    }, 'suggest_words', query, offset, desc);
 }
 
 function load_more() {
     if (!state.hasMore || state.loading) return;
-    request_page(state.items.length);
+    load_at(state.base + state.items.length);
+}
+
+function search(query) {
+    state.query = query;
+    state.base = 0;
+    clear_list();
+    load_at(0);
+}
+
+function jump(label) {
+    els.query.value = '';
+    state.query = '';
+    clear_list();
+    var gen = state.gen;
+    rpc(function (result) {
+        if (gen !== state.gen) return;
+        state.base = (result && result.offset) || 0;
+        els.list.scrollTop = 0;
+        load_at(state.base);
+    }, 'jump', label, state.desc);
 }
 
 // ------------------------------------------------------------------ actions
 
-function navigate(k_id) {
+function navigate(k_id, remember) {
     if (k_id === null || k_id === undefined) return;
+    if (remember !== false) record_history(k_id);
     var url = '/api/item/' + k_id;
     if (els.entry.getAttribute('src') !== url) {
         els.entry.setAttribute('src', url);
@@ -200,9 +226,34 @@ function mark_current(k_id) {
 }
 
 function pick(k_id) {
-    navigate(k_id);
+    navigate(k_id, true);
     if (rpc) rpc(function () { }, 'redirect', parseInt(k_id, 10));
     els.query.focus();
+}
+
+function record_history(k_id) {
+    var id = String(k_id);
+    if (nav.ids[nav.pos] === id) return;
+    nav.ids = nav.ids.slice(0, nav.pos + 1);
+    nav.ids.push(id);
+    nav.pos = nav.ids.length - 1;
+}
+
+function go_history(delta) {
+    var pos = nav.pos + delta;
+    if (pos < 0 || pos >= nav.ids.length) return;
+    nav.pos = pos;
+    navigate(nav.ids[pos], false);
+}
+
+function random_entry() {
+    if (!rpc) return;
+    rpc(function (result) {
+        if (!result) return;
+        els.query.value = result.word;
+        search(result.word);
+        navigate(result.k_id, true);
+    }, 'random');
 }
 
 function set_active(index) {
@@ -234,18 +285,34 @@ function pick_active() {
     pick(rows[index].dataset.id);
 }
 
-// ------------------------------------------------------------------ zoom
-
-function apply_zoom() {
-    if (els.entry.contentWindow) {
-        els.entry.contentWindow.postMessage({ type: 'zoom', value: state.zoom }, '*');
-    }
+function set_order(desc) {
+    state.desc = desc;
+    try { localStorage.setItem('preview.desc', desc ? '1' : '0'); } catch (e) { }
+    els.sortBtn.textContent = desc ? '↓' : '↑';
+    els.sortBtn.title = desc ? '当前倒序，点击切正序' : '当前正序，点击切倒序';
+    search(els.query.value.trim());
 }
 
-function set_zoom(value) {
-    state.zoom = Math.round(Math.min(2, Math.max(0.8, value)) * 100) / 100;
-    try { localStorage.setItem('preview.zoom', String(state.zoom)); } catch (e) { }
-    apply_zoom();
+// ------------------------------------------------------------------ initials
+
+function load_initials() {
+    if (!rpc) return;
+    rpc(function (rows) {
+        if (!rows) return;
+        els.initials.textContent = '';
+        rows.forEach(function (row) {
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'initial';
+            btn.textContent = row[0];
+            btn.title = '跳到 ' + row[0];
+            btn.addEventListener('click', function () {
+                jump(row[0]);
+                els.query.focus();
+            });
+            els.initials.appendChild(btn);
+        });
+    }, 'initials');
 }
 
 // ------------------------------------------------------------------ layout
@@ -312,6 +379,32 @@ function bind_events() {
             els.query.value = '';
             search('');
             e.preventDefault();
+        } else if (e.key === 'PageDown') {
+            move_active(10);
+            e.preventDefault();
+        } else if (e.key === 'PageUp') {
+            move_active(-10);
+            e.preventDefault();
+        } else if ((e.key === 'Home' || e.key === 'End') && !els.query.value) {
+            set_active(e.key === 'Home' ? 0 : els.list.children.length - 1);
+            e.preventDefault();
+        }
+    });
+
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'F5') {
+            e.preventDefault();
+            random_entry();
+        } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'l' || e.key === 'L')) {
+            e.preventDefault();
+            els.query.focus();
+            els.query.select();
+        } else if (e.altKey && e.key === 'ArrowLeft') {
+            e.preventDefault();
+            go_history(-1);
+        } else if (e.altKey && e.key === 'ArrowRight') {
+            e.preventDefault();
+            go_history(1);
         }
     });
 
@@ -327,29 +420,22 @@ function bind_events() {
         }
     });
 
-    els.entry.addEventListener('load', apply_zoom);
     window.addEventListener('resize', function () {
         if (state.hasMore && els.list.scrollHeight <= els.list.clientHeight + 8) {
             load_more();
         }
     });
-    window.addEventListener('message', function (e) {
-        var d = e.data;
-        if (d && d.type === 'ready') apply_zoom();
+
+    els.sortBtn.addEventListener('click', function () {
+        set_order(!state.desc);
     });
 
-    document.getElementById('zoom-in').addEventListener('click', function () {
-        set_zoom(state.zoom + 0.1);
+    // Keep the caret in the search box when the window regains focus.
+    window.addEventListener('focus', function () {
+        if (!document.activeElement || document.activeElement === document.body) {
+            els.query.focus();
+        }
     });
-    document.getElementById('zoom-out').addEventListener('click', function () {
-        set_zoom(state.zoom - 0.1);
-    });
-
-    document.addEventListener('wheel', function (e) {
-        if (!e.ctrlKey) return;
-        e.preventDefault();
-        set_zoom(state.zoom + (e.deltaY < 0 ? 0.1 : -0.1));
-    }, { passive: false });
 }
 
 function load_status() {
@@ -365,14 +451,17 @@ window.addEventListener('DOMContentLoaded', function () {
     els.query = document.getElementById('query');
     els.list = document.getElementById('word-list');
     els.status = document.getElementById('status');
+    els.initials = document.getElementById('initials');
     els.entry = document.getElementById('entry');
     els.splitter = document.getElementById('splitter');
+    els.sortBtn = document.getElementById('sort-btn');
 
     var savedWidth = parseInt(localStorage.getItem('preview.sidebarWidth'), 10);
     set_width(savedWidth > 0 ? savedWidth : DEFAULT_WIDTH, false);
 
-    var savedZoom = parseFloat(localStorage.getItem('preview.zoom'));
-    state.zoom = Math.min(2, Math.max(0.8, savedZoom > 0 ? savedZoom : 1));
+    state.desc = localStorage.getItem('preview.desc') === '1';
+    els.sortBtn.textContent = state.desc ? '↓' : '↑';
+    els.sortBtn.title = state.desc ? '当前倒序，点击切正序' : '当前正序，点击切倒序';
 
     bind_events();
     bind_splitter();
@@ -381,4 +470,5 @@ window.addEventListener('DOMContentLoaded', function () {
     // GoldenDict-style: the whole headword list is browsable before typing.
     search('');
     els.query.focus();
+    setTimeout(function () { els.query.focus(); }, 0);
 });

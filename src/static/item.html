@@ -99,29 +99,18 @@
     <h1 id="headword">{title}</h1>
     <div id="entry-body">{attributes}</div>
     <script>
-        (function () {
-            function apply(value) {
-                var v = Math.min(2, Math.max(0.8, Number(value) || 1));
-                document.body.style.zoom = v;
+        // <base> would otherwise send in-page anchors to the resource route.
+        document.addEventListener('click', function (e) {
+            var a = e.target && e.target.closest ? e.target.closest('a') : null;
+            if (!a) return;
+            var href = a.getAttribute('href') || '';
+            if (href.charAt(0) !== '#') return;
+            var target = document.getElementById(href.slice(1));
+            if (target) {
+                e.preventDefault();
+                target.scrollIntoView();
             }
-            window.addEventListener('message', function (e) {
-                var d = e.data;
-                if (d && d.type === 'zoom' && typeof d.value === 'number') apply(d.value);
-            });
-            // <base> would otherwise send in-page anchors to the resource route.
-            document.addEventListener('click', function (e) {
-                var a = e.target && e.target.closest ? e.target.closest('a') : null;
-                if (!a) return;
-                var href = a.getAttribute('href') || '';
-                if (href.charAt(0) !== '#') return;
-                var target = document.getElementById(href.slice(1));
-                if (target) {
-                    e.preventDefault();
-                    target.scrollIntoView();
-                }
-            });
-            try { parent.postMessage({ type: 'ready' }, '*'); } catch (err) { }
-        })();
+        });
     </script>
 </body>
 

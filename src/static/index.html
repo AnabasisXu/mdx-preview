@@ -13,17 +13,15 @@
 <body>
     <aside id="sidebar">
         <div id="search-row">
-            <input type="text" id="query" autocomplete="off" autocapitalize="off" spellcheck="false" />
+            <input type="text" id="query" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus />
+            <button type="button" id="sort-btn" title="切换词头顺序">↑</button>
         </div>
+        <div id="initials"></div>
         <div id="word-list" role="listbox"></div>
         <div id="status"></div>
     </aside>
     <div id="splitter" role="separator" aria-orientation="vertical" title="拖动调整宽度，双击复位"></div>
     <main id="pane">
-        <div id="toolbar">
-            <button type="button" id="zoom-out" title="缩小字号">A-</button>
-            <button type="button" id="zoom-in" title="放大字号">A+</button>
-        </div>
         <iframe id="entry" src="about:blank" title="词条"></iframe>
     </main>
 </body>

@@ -363,22 +363,28 @@ fn resolve_links(entries: &mut [(String, String)]) {
                 .and_then(|name| index.get(name).copied())
         })
         .collect();
-    let resolved: Vec<String> = (0..entries.len())
+    let targets: Vec<Option<usize>> = (0..entries.len())
         .map(|i| {
             let (mut cur, mut hops) = (i, 0);
-            while let Some(j) = link[cur] {
-                if j == i || hops == 16 {
-                    return entries[i].1.clone(); // cycle: keep the marker
+            loop {
+                match link[cur] {
+                    Some(j) if j == i || hops == 16 => return None, // cycle
+                    Some(j) => {
+                        cur = j;
+                        hops += 1;
+                    }
+                    None => return Some(cur),
                 }
-                cur = j;
-                hops += 1;
             }
-            entries[cur].1.clone()
         })
         .collect();
-    for (i, text) in resolved.into_iter().enumerate() {
-        if link[i].is_some() {
-            entries[i].1 = text;
+    // Only redirect entries pay for a copy; plain entries are left untouched.
+    for (i, target) in targets.into_iter().enumerate() {
+        if let Some(t) = target {
+            if t != i {
+                let text = entries[t].1.clone();
+                entries[i].1 = text;
+            }
         }
     }
 }
@@ -680,19 +686,29 @@ fn load_resources(mdx: &str) -> (Vec<Mdd>, HashMap<String, Resource>) {
 // ---------------------------------------------------------------- web layer
 
 struct Dict {
-    words: Vec<(String, u32)>,
-    texts: HashMap<u32, String>,
+    /// Display headwords in file order; a word's id is its index + 1.
+    words: Vec<String>,
+    /// Lowercased headwords, computed once so filtering never allocates per word.
+    lower: Vec<String>,
+    texts: Vec<String>,
     encoding: String,
+    /// Jump bar buckets: (label, first index, last index) in file order.
+    initials: Vec<(String, usize, usize)>,
 }
 
 impl Dict {
-    fn suggest_page(&self, q: &str, offset: usize, limit: usize) -> (Vec<(String, u32)>, bool) {
-        let q = q.to_lowercase();
+    fn page<I: Iterator<Item = usize>>(
+        &self,
+        idxs: I,
+        q: &str,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<(String, u32)>, bool) {
         let mut items = Vec::with_capacity(limit);
         let mut skipped = 0;
         let mut has_more = false;
-        for (word, id) in &self.words {
-            if !q.is_empty() && !word.to_lowercase().contains(&q) {
+        for i in idxs {
+            if !q.is_empty() && !self.lower[i].contains(q) {
                 continue;
             }
             if skipped < offset {
@@ -700,7 +716,7 @@ impl Dict {
                 continue;
             }
             if items.len() < limit {
-                items.push((word.clone(), *id));
+                items.push((self.words[i].clone(), (i + 1) as u32));
             } else {
                 has_more = true;
                 break;
@@ -708,6 +724,79 @@ impl Dict {
         }
         (items, has_more)
     }
+
+    fn suggest_page(
+        &self,
+        q: &str,
+        offset: usize,
+        limit: usize,
+        desc: bool,
+    ) -> (Vec<(String, u32)>, bool) {
+        let q = q.to_lowercase();
+        if desc {
+            self.page((0..self.words.len()).rev(), &q, offset, limit)
+        } else {
+            self.page(0..self.words.len(), &q, offset, limit)
+        }
+    }
+
+    fn word(&self, id: u32) -> Option<&str> {
+        (id as usize)
+            .checked_sub(1)
+            .and_then(|i| self.words.get(i))
+            .map(String::as_str)
+    }
+
+    fn text(&self, id: u32) -> Option<&str> {
+        (id as usize)
+            .checked_sub(1)
+            .and_then(|i| self.texts.get(i))
+            .map(String::as_str)
+    }
+}
+
+/// First-character jump bar. ASCII letters/digits get one bucket each; other
+/// scripts (CJK, kana, ...) are sampled down so the strip stays usable.
+fn build_initials(words: &[String]) -> Vec<(String, usize, usize)> {
+    let mut map: HashMap<String, (usize, usize)> = HashMap::new();
+    for (i, word) in words.iter().enumerate() {
+        let Some(first) = word.chars().next() else {
+            continue;
+        };
+        let label = if first.is_ascii_alphanumeric() {
+            first.to_ascii_lowercase().to_string()
+        } else {
+            first.to_string()
+        };
+        map.entry(label)
+            .and_modify(|(_, last)| *last = i)
+            .or_insert((i, i));
+    }
+    let (mut ascii, mut other): (Vec<_>, Vec<_>) = map
+        .into_iter()
+        .map(|(label, (first, last))| (label, first, last))
+        .partition(|(label, _, _)| label.chars().all(|c| c.is_ascii_alphanumeric()));
+    ascii.sort_by(|a, b| a.0.cmp(&b.0));
+    other.sort_by_key(|(_, first, _)| *first);
+    const MAX_BUCKETS: usize = 48;
+    if !other.is_empty() && ascii.len() + other.len() > MAX_BUCKETS {
+        let keep = MAX_BUCKETS.saturating_sub(ascii.len()).max(8);
+        let step = ((other.len() as f64) / (keep as f64)).ceil() as usize;
+        other = other.into_iter().step_by(step.max(1)).collect();
+    }
+    ascii.extend(other);
+    ascii
+}
+
+fn rand_index(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64))
+        .unwrap_or(0);
+    (seed % n as u64) as usize
 }
 
 struct AppState {
@@ -768,15 +857,9 @@ async fn parser(state: web::Data<AppState>) -> impl Responder {
 #[get("/api/item/{k_id}")]
 async fn item(k_id: web::Path<u32>, state: web::Data<AppState>) -> impl Responder {
     let k_id = k_id.into_inner();
-    match state.dict.texts.get(&k_id) {
+    match state.dict.text(k_id) {
         Some(text) => {
-            let title = state
-                .dict
-                .words
-                .iter()
-                .find(|(_, id)| *id == k_id)
-                .map(|(w, _)| w.as_str())
-                .unwrap_or("");
+            let title = state.dict.word(k_id).unwrap_or("");
             HttpResponse::Ok()
                 .content_type("text/html; charset=utf-8")
                 .body(render_item(title, text))
@@ -786,7 +869,7 @@ async fn item(k_id: web::Path<u32>, state: web::Data<AppState>) -> impl Responde
 }
 #[get("/api/lookup/{word}")]
 async fn lookup(word: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
-    let (hits, has_more) = state.dict.suggest_page(&word, 0, 20);
+    let (hits, has_more) = state.dict.suggest_page(&word, 0, 20, false);
     HttpResponse::Ok().json(json!({"items": hits, "has_more": has_more}))
 }
 
@@ -829,6 +912,9 @@ async fn res_file(path: web::Path<String>, state: web::Data<AppState>) -> impl R
 async fn fallback(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     let decoded = percent_encoding::percent_decode_str(req.path()).decode_utf8_lossy();
     let mut rel = decoded.as_ref();
+    if rel.ends_with("/favicon.ico") || rel == "/favicon.ico" {
+        return HttpResponse::NoContent().finish();
+    }
     if !base().is_empty() {
         if let Some(rest) = rel.strip_prefix(base()) {
             rel = rest;
@@ -912,7 +998,12 @@ async fn ws(
                             let q = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
                             let offset =
                                 params.get(1).and_then(|p| p.as_u64()).unwrap_or(0) as usize;
-                            let (hits, has_more) = state2.dict.suggest_page(q, offset, 20);
+                            let desc = params
+                                .get(2)
+                                .and_then(|p| p.as_bool())
+                                .unwrap_or(false);
+                            let (hits, has_more) =
+                                state2.dict.suggest_page(q, offset, 20, desc);
                             let items: Vec<[Value; 2]> = hits
                                 .into_iter()
                                 .map(|(w, id)| [json!(w), json!(id)])
@@ -921,8 +1012,41 @@ async fn ws(
                         }
                         "load_text" => {
                             let k = params.get(0).and_then(|p| p.as_u64()).unwrap_or(0) as u32;
-                            let text = state2.dict.texts.get(&k).cloned().unwrap_or_default();
+                            let text = state2.dict.text(k).unwrap_or("").to_string();
                             json!({"id": id, "result": text, "error": null})
+                        }
+                        "random" => {
+                            let n = state2.dict.words.len();
+                            let i = rand_index(n);
+                            json!({"id": id, "result": {
+                                "word": state2.dict.words[i],
+                                "k_id": (i + 1) as u32,
+                            }, "error": null})
+                        }
+                        "initials" => {
+                            json!({"id": id, "result": state2.dict.initials, "error": null})
+                        }
+                        "jump" => {
+                            let label = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
+                            let desc = params
+                                .get(1)
+                                .and_then(|p| p.as_bool())
+                                .unwrap_or(false);
+                            let n = state2.dict.words.len();
+                            let offset = state2
+                                .dict
+                                .initials
+                                .iter()
+                                .find(|(l, _, _)| l == label)
+                                .map(|(_, first, last)| {
+                                    if desc {
+                                        n.saturating_sub(1).saturating_sub(*last)
+                                    } else {
+                                        *first
+                                    }
+                                })
+                                .unwrap_or(0);
+                            json!({"id": id, "result": {"offset": offset}, "error": null})
                         }
                         "redirect" => {
                             let k = params.get(0).cloned().unwrap_or(Value::Null);
@@ -989,18 +1113,22 @@ async fn main() -> std::io::Result<()> {
     }
     let count = entries.len();
     let mut words = Vec::with_capacity(count);
-    let mut texts = HashMap::with_capacity(count);
-    for (i, (word, text)) in entries.into_iter().enumerate() {
-        let id = (i + 1) as u32;
-        words.push((word, id));
-        texts.insert(id, text);
+    let mut lower = Vec::with_capacity(count);
+    let mut texts = Vec::with_capacity(count);
+    for (word, text) in entries {
+        lower.push(word.to_lowercase());
+        words.push(word);
+        texts.push(text);
     }
+    let initials = build_initials(&words);
     let _ = BASE.set(base.clone());
 
     let dict = Arc::new(Dict {
         words,
+        lower,
         texts,
         encoding,
+        initials,
     });
     let (mdds, res) = load_resources(&file);
     let (tx, _rx) = broadcast::channel(32);

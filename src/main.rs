@@ -38,6 +38,19 @@ fn rebase(text: &str) -> String {
         .replace("/api/", &format!("{b}/api/"))
 }
 
+/// Accept both `/mdx-preview` and `mdx-preview/`; `/` and `""` mean site root.
+fn normalize_base(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 // ---------------------------------------------------------------- MDX reader
 
 fn be_u16(d: &[u8], i: usize) -> u16 {
@@ -269,10 +282,48 @@ fn load_mdx(path: &str) -> io::Result<(Vec<(String, String)>, String)> {
             stream.len()
         };
         let text = String::from_utf8_lossy(&stream[start.min(stream.len())..end.min(stream.len())])
+            .trim_end_matches('\0')
             .to_string();
         out.push((keys[idx].1.clone(), text));
     }
+    resolve_links(&mut out);
     Ok((out, encoding))
+}
+
+/// MDict redirect entries carry no content of their own: their body is
+/// `@@@LINK=other headword`. Show the target entry instead of the raw marker.
+fn resolve_links(entries: &mut [(String, String)]) {
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
+    for (i, (word, _)) in entries.iter().enumerate() {
+        index.entry(word.as_str()).or_insert(i);
+    }
+    let link: Vec<Option<usize>> = entries
+        .iter()
+        .map(|(_, text)| {
+            text.trim()
+                .strip_prefix("@@@LINK=")
+                .map(str::trim)
+                .and_then(|name| index.get(name).copied())
+        })
+        .collect();
+    let resolved: Vec<String> = (0..entries.len())
+        .map(|i| {
+            let (mut cur, mut hops) = (i, 0);
+            while let Some(j) = link[cur] {
+                if j == i || hops == 16 {
+                    return entries[i].1.clone(); // cycle: keep the marker
+                }
+                cur = j;
+                hops += 1;
+            }
+            entries[cur].1.clone()
+        })
+        .collect();
+    for (i, text) in resolved.into_iter().enumerate() {
+        if link[i].is_some() {
+            entries[i].1 = text;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- web layer
@@ -324,6 +375,32 @@ async fn index_page() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(rebase(INDEX_HTML))
+}
+
+/// The app always lives under `base`; a bare `/` only redirects there.
+#[get("/")]
+async fn root_redirect() -> impl Responder {
+    HttpResponse::Found()
+        .insert_header(("Location", format!("{}/", base())))
+        .finish()
+}
+
+fn routes(cfg: &mut web::ServiceConfig) {
+    cfg.service(index_page)
+        .service(welcome)
+        .service(parser)
+        .service(item)
+        .service(lookup)
+        .service(static_file)
+        .service(dist)
+        .service(favicon)
+        .service(ws);
+}
+
+fn root(cfg: &mut web::ServiceConfig) {
+    if !base().is_empty() {
+        cfg.service(root_redirect);
+    }
 }
 
 fn render_item(title: &str, body_html: &str, state: &AppState) -> String {
@@ -527,6 +604,7 @@ async fn main() -> std::io::Result<()> {
         }
     }
     let file = file.unwrap_or_else(|| usage());
+    let base = normalize_base(&base);
 
     let (entries, encoding) = match load_mdx(&file) {
         Ok(v) => v,
@@ -562,15 +640,8 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
-            .service(index_page)
-            .service(welcome)
-            .service(parser)
-            .service(item)
-            .service(lookup)
-            .service(static_file)
-            .service(dist)
-            .service(favicon)
-            .service(ws)
+            .configure(root)
+            .service(web::scope(base.as_str()).configure(routes))
     })
     .bind(("127.0.0.1", port))?
     .run()

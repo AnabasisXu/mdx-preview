@@ -33,12 +33,24 @@ function ajax_ws(path, callbacks) {
     if (conn != null) conn.close(), conn = null;
 
     var ws_uri = (window.location.protocol == 'https:' && 'wss://' || 'ws://') + window.location.host + path;
-    conn = new WebSocket(ws_uri);
+    var socket = new WebSocket(ws_uri);
+    conn = socket;
 
-    conn.onopen = callbacks['onopen'] || function () { };
-    conn.onclose = callbacks['onclose'] || function () { };
+    // Requests issued before the handshake completes are queued, not dropped.
+    var pending = [];
+    function flush() {
+        while (pending.length && socket.readyState === WebSocket.OPEN) {
+            socket.send(pending.shift());
+        }
+    }
 
-    conn.onmessage = function (e) {
+    socket.onopen = function (e) {
+        flush();
+        if (callbacks['onopen']) callbacks['onopen'](e);
+    };
+    socket.onclose = callbacks['onclose'] || function () { };
+
+    socket.onmessage = function (e) {
         log('recv:', e.data);
         var resp;
         try { resp = JSON.parse(e.data); } catch (err) { return; }
@@ -68,7 +80,12 @@ function ajax_ws(path, callbacks) {
 
         callbacks[id] = callback;
         var params = [].slice.call(arguments, 2);
-        conn.send(JSON.stringify({ id: id, method: method, params: params }));
+        var msg = JSON.stringify({ id: id, method: method, params: params });
+        if (socket.readyState === WebSocket.OPEN) {
+            socket.send(msg);
+        } else if (socket.readyState === WebSocket.CONNECTING) {
+            pending.push(msg);
+        }
     };
 }
 
@@ -152,7 +169,6 @@ function request_page(offset) {
 function search(query) {
     state.query = query;
     clear_list();
-    if (!query) return;
     request_page(0);
 }
 
@@ -168,6 +184,18 @@ function navigate(k_id) {
     var url = '/api/item/' + k_id;
     if (els.entry.getAttribute('src') !== url) {
         els.entry.setAttribute('src', url);
+    }
+    mark_current(k_id);
+}
+
+function mark_current(k_id) {
+    var rows = els.list.children;
+    var want = String(k_id);
+    for (var i = 0; i < rows.length; i++) {
+        if (rows[i].dataset.id === want) {
+            set_active(i);
+            return;
+        }
     }
 }
 
@@ -350,5 +378,7 @@ window.addEventListener('DOMContentLoaded', function () {
     bind_splitter();
     bind_ws();
     load_status();
+    // GoldenDict-style: the whole headword list is browsable before typing.
+    search('');
     els.query.focus();
 });

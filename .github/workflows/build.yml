@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,16 +19,26 @@ jobs:
           path: target/release/prev
 
   build-windows:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-gnu
+      - name: Install zig and cargo-zigbuild
+        run: |
+          python3 -m pip install --user ziglang || python3 -m pip install --user --break-system-packages ziglang
+          ZIG=$(python3 -c 'import ziglang, os; print(os.path.join(os.path.dirname(ziglang.__file__), "zig"))')
+          chmod +x "$ZIG"
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$ZIG" "$HOME/.local/bin/zig"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/zig" version
+          cargo install cargo-zigbuild --locked
       - name: Build prev.exe
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo zigbuild --release --target x86_64-pc-windows-gnu
       - name: Upload Windows binary
         uses: actions/upload-artifact@v4
         with:
           name: prev-windows-x86_64
-          path: target/x86_64-pc-windows-msvc/release/prev.exe
+          path: target/x86_64-pc-windows-gnu/release/prev.exe

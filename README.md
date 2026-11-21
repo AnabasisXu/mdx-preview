@@ -71,6 +71,27 @@ prev <dictionary.mdx> [--port N] [--base PATH]
 
 对比改造前（全量解压进内存）：Langeek 启动 1.9 s、443 MB；大词典会直接耗尽内存。
 
+## 内存实测
+
+实际使用（细说规范字，740 条 + 56 MB mdd，浏览器连续查词），三次采样：
+
+| 指标 | 值 |
+|---|---|
+| 工作集 | 9.2–9.5 MB |
+| 私有内存 | 4.4–4.9 MB |
+| 峰值工作集 | 10.8 MB |
+| 线程 / 句柄 | 10 / 93–95 |
+| 累计 CPU（约 2 分钟） | 0.3 s |
+
+压力测试（同一二进制，2000 次取词 + 296 次搜索）：
+
+| 词典 | 起始 工作集 / 私有 | 压测后 工作集 / 私有 | 空闲 3 s 后 | 私有增量 |
+|---|---|---|---|---|
+| Langeek 68 584 条（72 MB） | 22.7 / 18.5 MB | 47.3 / 21.5 MB | 不变 | +3.0 MB |
+| zhwiki 2 975 632 条（3.2 GB） | 465.5 / 448.4 MB | 521.5 / 450.9 MB | 不变 | +2.5 MB |
+
+工作集的增长来自 mmap 的词典文件页，属可回收的 file-backed 内存；私有内存基本不随查询增长。3 GB 词典的 448 MB 私有内存几乎全是词头索引。
+
 ## 构建
 
 ```sh
@@ -86,7 +107,7 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 # 产物：target/x86_64-pc-windows-gnu/release/prev.exe
 ```
 
-仓库自带 GitHub Actions：Linux 构建 `prev`，Windows 构建 MSVC 版 `prev.exe`。
+仓库自带 GitHub Actions：Linux 构建 `prev`；Windows 用 zig 交叉编译 GNU 版 `prev.exe`，与本地 `cargo zigbuild` 产物同一目标（`x86_64-pc-windows-gnu`），不是 MSVC 构建。
 
 ## 已知限制
 
@@ -94,7 +115,7 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 - `Encrypted=1/3`（需要用户识别码）的词典拒绝加载；对应的 `.mdd` 会被跳过
 - 记录块没有缓存，同一页大量图片会重复解压所在块（实测 95 张图仍为秒开）
 - 词条页的 `<base>` 会改变相对链接语义，`#锚点` 已单独拦截处理；相对路径资源全部走 `.mdd`，缺失时 404
-- 超大词典的索引常驻内存：300 万词条约 460 MB（主要来自词头与大小写副本）
+- 超大词典的索引常驻内存：300 万词条约 450 MB（主要来自词头与大小写副本）
 
 ## 目录
 

@@ -15,7 +15,9 @@ var state = {
     selected: -1,
     base: 0,
     desc: false,
-    gen: 0
+    gen: 0,
+    total: 0,
+    pendingMove: 0
 };
 
 // Visited entries, for Alt+Left / Alt+Right.
@@ -178,6 +180,7 @@ function load_at(offset, done) {
         if (state.hasMore && els.list.scrollHeight <= els.list.clientHeight + 8) {
             load_more();
         }
+        flush_pending();
     }, 'suggest_words', query, offset, desc);
 }
 
@@ -224,6 +227,7 @@ function load_prev(done) {
         }
         els.list.scrollTop += els.list.scrollHeight - old_height;
         if (done) done(true, items.length);
+        flush_pending();
     }, 'suggest_words', query, offset, desc);
 }
 
@@ -316,9 +320,37 @@ function set_active(index) {
     rows[index].scrollIntoView({ block: 'nearest' });
 }
 
+function page_step() {
+    var rows = els.list.children;
+    var row = rows.length ? rows[0].offsetHeight : 21;
+    return Math.max(5, Math.floor(els.list.clientHeight / (row || 21)));
+}
+
+function jump_to_offset(offset, select_last) {
+    clear_list();
+    state.base = Math.max(0, offset);
+    els.list.scrollTop = 0;
+    load_at(state.base, function (ok) {
+        if (!ok || !els.list.children.length) return;
+        set_active(select_last ? els.list.children.length - 1 : 0);
+    });
+}
+
+function flush_pending() {
+    if (state.loading || !state.pendingMove) return;
+    var delta = state.pendingMove;
+    state.pendingMove = 0;
+    move_active(delta);
+}
+
 function move_active(delta) {
     var rows = els.list.children;
     if (!rows.length) return;
+    // Key repeat can outrun the network; queue the surplus instead of dropping it.
+    if (state.loading) {
+        state.pendingMove += delta;
+        return;
+    }
     var from = state.selected < 0 ? 0 : state.selected;
     var next = from + delta;
     if (next < 0) {
@@ -454,13 +486,17 @@ function bind_events() {
             search('');
             e.preventDefault();
         } else if (e.key === 'PageDown') {
-            move_active(10);
+            move_active(page_step());
             e.preventDefault();
         } else if (e.key === 'PageUp') {
-            move_active(-10);
+            move_active(-page_step());
             e.preventDefault();
         } else if ((e.key === 'Home' || e.key === 'End') && !els.query.value) {
-            set_active(e.key === 'Home' ? 0 : els.list.children.length - 1);
+            if (e.key === 'Home') {
+                jump_to_offset(0, false);
+            } else {
+                jump_to_offset(Math.max(0, state.total - 20), true);
+            }
             e.preventDefault();
         }
     });
@@ -518,6 +554,7 @@ function load_status() {
     fetch('/api/parser')
         .then(function (r) { return r.json(); })
         .then(function (data) {
+            state.total = data.count;
             els.status.textContent = data.count + ' 词条 · ' + data.encoding;
         })
         .catch(function () { });

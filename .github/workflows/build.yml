@@ -76,11 +76,11 @@ jobs:
       - name: Package
         run: |
           set -e
-          tag="${GITHUB_REF_NAME}"
+          ver="${GITHUB_REF_NAME#v}"
           mkdir -p out
-          cp dist/prev-linux-x86_64/prev "out/prev-${tag}-linux-x86_64"
-          cp dist/prev-linux-musl-x86_64/prev "out/prev-${tag}-linux-x86_64-musl"
-          cp dist/prev-windows-x86_64/prev.exe "out/prev-${tag}-windows-x86_64.exe"
+          cp dist/prev-linux-x86_64/prev "out/prev-${ver}-linux-x86_64"
+          cp dist/prev-linux-musl-x86_64/prev "out/prev-${ver}-linux-x86_64-musl"
+          cp dist/prev-windows-x86_64/prev.exe "out/prev-${ver}-windows-x86_64.exe"
           (cd out && sha256sum * > SHA256SUMS)
           ls -l out
       - name: Publish

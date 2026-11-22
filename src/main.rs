@@ -169,7 +169,6 @@ struct Mdx {
     words: Vec<String>,
     /// Entry ids sorted by headword, for `@@@LINK=` lookups.
     sorted: Vec<u32>,
-    encoding: String,
     codec: Option<&'static Encoding>,
 }
 
@@ -445,7 +444,6 @@ fn load_mdx(path: &str) -> io::Result<Mdx> {
         ends,
         words,
         sorted,
-        encoding,
         codec,
     })
 }

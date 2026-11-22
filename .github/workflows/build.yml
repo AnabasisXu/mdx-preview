@@ -89,8 +89,8 @@ jobs:
         run: |
           set -e
           tag="${GITHUB_REF_NAME}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" out/* --clobber
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" out/* --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$tag" out/* --title "prev $tag" --generate-notes --verify-tag
+            gh release create "$tag" out/* --title "prev $tag" --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
           fi

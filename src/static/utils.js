@@ -778,6 +778,10 @@ function open_dict_pop() {
 }
 
 function close_dict_pop() {
+    // Move the caret out before hiding the subtree: hiding the focused filter
+    // first drops focus to <body> in some browsers, and a later query.focus()
+    // does not always take.
+    if (els.dictPop.contains(document.activeElement)) els.query.focus();
     els.dictPop.hidden = true;
 }
 
@@ -804,7 +808,7 @@ function render_dict_rows(filter) {
         row.addEventListener('click', function () {
             close_dict_pop();
             switch_dict(d.id);
-            els.query.focus();
+            focus_query_after_switch();
         });
         els.dictList.appendChild(row);
         shown++;
@@ -829,12 +833,26 @@ function dict_pop_move(delta) {
     paint_dict_sel();
 }
 
+function focus_query_after_switch() {
+    els.query.focus();
+    // Some environments move focus to <body> (or into the entry frame) a tick
+    // after the popup closes; reassert only when the caret fell off the shell.
+    function reassert() {
+        var a = document.activeElement;
+        if (!a || a === document.body || a === els.entry || els.dictPop.contains(a)) {
+            els.query.focus();
+        }
+    }
+    setTimeout(reassert, 0);
+    setTimeout(reassert, 60);
+}
+
 function dict_pop_choose() {
     var row = els.dictList.children[dictPopSel];
     if (!row) return;
     close_dict_pop();
     switch_dict(parseInt(row.dataset.id, 10));
-    els.query.focus();
+    focus_query_after_switch();
 }
 
 function bind_dict_picker() {

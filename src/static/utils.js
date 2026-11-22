@@ -34,8 +34,6 @@ var nav = { items: [], pos: -1 };  // 'history' is a read-only window property
 
 // Dictionary picker: selected row index within the filtered list.
 var dictPopSel = 0;
-// 'search' shows the filter box; 'browse' shows the plain clickable list.
-var dictPopMode = 'search';
 
 var DEFAULT_WIDTH = 260;
 var MIN_WIDTH = 180;
@@ -568,27 +566,11 @@ function bind_events() {
     });
 
     document.addEventListener('keydown', function (e) {
-        if (!els.dictPop.hidden) {
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                close_dict_pop();
-                els.query.focus();
-                return;
-            }
-            // The filter handles its own keys; this keeps arrows/Enter working
-            // when focus sits on the list (browse mode) or anywhere else.
-            if (document.activeElement !== els.dictFilter) {
-                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    dict_pop_move(e.key === 'ArrowDown' ? 1 : -1);
-                    return;
-                }
-                if (e.key === 'Enter') {
-                    e.preventDefault();
-                    dict_pop_choose();
-                    return;
-                }
-            }
+        if (!els.dictPop.hidden && e.key === 'Escape') {
+            e.preventDefault();
+            close_dict_pop();
+            els.query.focus();
+            return;
         }
         if (e.key === 'F5') {
             e.preventDefault();
@@ -605,10 +587,7 @@ function bind_events() {
             go_history(1);
         } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'p' || e.key === 'P')) {
             e.preventDefault();
-            toggle_dict_pop('search');
-        } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'b' || e.key === 'B')) {
-            e.preventDefault();
-            toggle_dict_pop('browse');
+            toggle_dict_pop();
         } else if (e.altKey && !e.ctrlKey && e.key >= '1' && e.key <= '9') {
             var want = parseInt(e.key, 10) - 1;
             if (state.dicts[want]) {
@@ -731,20 +710,18 @@ function switch_dict(id, keepEntry) {
     }
 }
 
-function toggle_dict_pop(mode) {
+function toggle_dict_pop() {
     if (!els.dictPop.hidden) {
         close_dict_pop();
         return;
     }
-    open_dict_pop(mode);
+    open_dict_pop();
 }
 
-function open_dict_pop(mode) {
+function open_dict_pop() {
     if (state.dicts.length < 2) return;
-    dictPopMode = mode;
     dictPopSel = 0;
     els.dictFilter.value = '';
-    els.dictFilter.hidden = mode !== 'search';
     render_dict_rows('');
     var rows = els.dictList.children;
     for (var i = 0; i < rows.length; i++) {
@@ -753,16 +730,12 @@ function open_dict_pop(mode) {
     paint_dict_sel();
     els.dictPop.hidden = false;
     els.dictPop.style.top = (els.dictRow.offsetTop + els.dictRow.offsetHeight) + 'px';
-    if (mode === 'search') {
-        els.dictFilter.focus();
-        // Some browsers finish their own default action after this handler and
-        // steal focus back; take it again on the next task.
-        setTimeout(function () {
-            try { els.dictFilter.focus(); } catch (e) { }
-        }, 0);
-    } else {
-        els.dictList.focus();
-    }
+    els.dictFilter.focus();
+    // Some browsers finish their own default action after this handler and
+    // steal focus back; take it again on the next task.
+    setTimeout(function () {
+        try { els.dictFilter.focus(); } catch (e) { }
+    }, 0);
 }
 
 function close_dict_pop() {
@@ -827,7 +800,7 @@ function dict_pop_choose() {
 
 function bind_dict_picker() {
     els.dictBtn.addEventListener('click', function () {
-        toggle_dict_pop('search');
+        toggle_dict_pop();
     });
     els.dictFilter.addEventListener('input', function () {
         dictPopSel = 0;

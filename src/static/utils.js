@@ -34,6 +34,8 @@ var nav = { items: [], pos: -1 };  // 'history' is a read-only window property
 
 // Dictionary picker: selected row index within the filtered list.
 var dictPopSel = 0;
+// 'search' shows the filter box; 'browse' shows the plain clickable list.
+var dictPopMode = 'search';
 
 var DEFAULT_WIDTH = 260;
 var MIN_WIDTH = 180;
@@ -566,6 +568,12 @@ function bind_events() {
     });
 
     document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !els.dictPop.hidden) {
+            e.preventDefault();
+            close_dict_pop();
+            els.query.focus();
+            return;
+        }
         if (e.key === 'F5') {
             e.preventDefault();
             random_entry();
@@ -579,10 +587,12 @@ function bind_events() {
         } else if (e.altKey && e.key === 'ArrowRight') {
             e.preventDefault();
             go_history(1);
-        } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K')) {
+        } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'p' || e.key === 'P')) {
             e.preventDefault();
-            if (els.dictPop.hidden) open_dict_pop();
-            else close_dict_pop();
+            toggle_dict_pop('search');
+        } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'b' || e.key === 'B')) {
+            e.preventDefault();
+            toggle_dict_pop('browse');
         } else if (e.altKey && !e.ctrlKey && e.key >= '1' && e.key <= '9') {
             var want = parseInt(e.key, 10) - 1;
             if (state.dicts[want]) {
@@ -659,7 +669,7 @@ function update_status() {
 function render_dict_button() {
     var d = current_dict();
     els.dictBtn.textContent = (d ? d.name : '…') + ' \u25be';
-    els.dictBtn.title = d && d.path ? d.path : '切换词典 (Ctrl+K)';
+    els.dictBtn.title = d && d.path ? d.path + '  (Ctrl+P)' : '切换词典 (Ctrl+P)';
     els.dictBtn.disabled = state.dicts.length < 2;
 }
 
@@ -705,10 +715,20 @@ function switch_dict(id, keepEntry) {
     }
 }
 
-function open_dict_pop() {
+function toggle_dict_pop(mode) {
+    if (!els.dictPop.hidden) {
+        close_dict_pop();
+        return;
+    }
+    open_dict_pop(mode);
+}
+
+function open_dict_pop(mode) {
     if (state.dicts.length < 2) return;
+    dictPopMode = mode;
     dictPopSel = 0;
     els.dictFilter.value = '';
+    els.dictFilter.hidden = mode !== 'search';
     render_dict_rows('');
     var rows = els.dictList.children;
     for (var i = 0; i < rows.length; i++) {
@@ -717,7 +737,8 @@ function open_dict_pop() {
     paint_dict_sel();
     els.dictPop.hidden = false;
     els.dictPop.style.top = (els.dictRow.offsetTop + els.dictRow.offsetHeight) + 'px';
-    els.dictFilter.focus();
+    if (mode === 'search') els.dictFilter.focus();
+    else els.dictList.focus();
 }
 
 function close_dict_pop() {
@@ -782,8 +803,7 @@ function dict_pop_choose() {
 
 function bind_dict_picker() {
     els.dictBtn.addEventListener('click', function () {
-        if (els.dictPop.hidden) open_dict_pop();
-        else close_dict_pop();
+        toggle_dict_pop('search');
     });
     els.dictFilter.addEventListener('input', function () {
         dictPopSel = 0;

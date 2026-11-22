@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [master]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -27,6 +28,15 @@ jobs:
         with:
           name: prev-linux-x86_64
           path: target/release/prev
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Build prev (static musl)
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Upload static binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: prev-linux-musl-x86_64
+          path: target/x86_64-unknown-linux-musl/release/prev
 
   build-windows:
     runs-on: ubuntu-latest
@@ -52,3 +62,35 @@ jobs:
         with:
           name: prev-windows-x86_64
           path: target/x86_64-pc-windows-gnu/release/prev.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Package
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p out
+          cp dist/prev-linux-x86_64/prev "out/prev-${tag}-linux-x86_64"
+          cp dist/prev-linux-musl-x86_64/prev "out/prev-${tag}-linux-x86_64-musl"
+          cp dist/prev-windows-x86_64/prev.exe "out/prev-${tag}-windows-x86_64.exe"
+          (cd out && sha256sum * > SHA256SUMS)
+          ls -l out
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" out/* --clobber
+          else
+            gh release create "$tag" out/* --title "prev $tag" --generate-notes --verify-tag
+          fi

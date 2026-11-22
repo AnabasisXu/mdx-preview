@@ -2,6 +2,7 @@
 
 [![build](https://github.com/AnabasisXu/mdx-preview/actions/workflows/build.yml/badge.svg)](https://github.com/AnabasisXu/mdx-preview/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/AnabasisXu/mdx-preview?display_name=tag)](https://github.com/AnabasisXu/mdx-preview/releases)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 
 单文件 MDict（`.mdx` / `.mdd`）浏览器，inspired by [Preview - 修改MDX CSS的神器，支持CSSJS实时预览](https://forum.freemdict.com/t/topic/1251)
 
@@ -42,6 +43,7 @@ prev <path>... [--port N] [--base PATH]
   --port N      监听端口，默认 3030（只绑定 127.0.0.1）
   --base PATH   公开挂载前缀，默认 /mdx-preview
   -h, --help    输出版本与用法后退出
+  -V, --version 输出程序版本
 ```
 
 - `--base ""` 表示挂在站点根路径（`http://127.0.0.1:3030/`）
@@ -157,6 +159,7 @@ python3 tests/smoke.py target/release/prev /path/to/sample.mdx
 
 ## 更新记录
 
+- **0.2.1**：新增 `prev --version` / `-V`；Linux 增加静态 musl 产物（老发行版可直接运行）；采用 MIT OR Apache-2.0 双许可；tag push 由 CI 自动构建并发布 release。
 - **0.2.0**：一次加载多部词典（`.mdx` 文件或目录，递归含子目录）；接口按词典命名空间化并加入词典切换器；词表索引按词典惰性构建，目录模式启动为毫秒级；跳转条改为等距覆盖并随左栏宽度自适应；点击词条后焦点回到外壳，Surfingkeys 继续可用；支持同目录 CSS/JS 覆盖与保存后热重载，`entry://` / `sound://` 链接触发词条与资源跳转；损坏的 `.mdx` / `.mdd` 报错并跳过而不是崩溃。
 - **0.1.0**：首个版本，单文件 MDX/MDD 预览器。
 
@@ -171,3 +174,7 @@ src/static/item.html    词条模板（通用排版 + 资源 base）
 tests/smoke.py          HTTP/WS 冒烟测试
 docs/plans/             设计与实施计划
 ```
+
+## 许可证
+
+MIT OR Apache-2.0 双许可，任选其一：[LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)。

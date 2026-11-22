@@ -1585,10 +1585,16 @@ fn help() -> ! {
          \x20 --port N      listen port on 127.0.0.1 (default 3030)\n\
          \x20 --base PATH   public mount prefix (default /mdx-preview)\n\
          \x20 -h, --help    show this help\n\
+         \x20 -V, --version print the version\n\
          \n\
          env: PREVIEW_BASE overrides --base",
         env!("CARGO_PKG_VERSION")
     );
+    std::process::exit(0);
+}
+
+fn version() -> ! {
+    println!("prev {}", env!("CARGO_PKG_VERSION"));
     std::process::exit(0);
 }
 
@@ -1713,6 +1719,7 @@ async fn main() -> std::io::Result<()> {
             }
             "--base" | "-b" => base = args.next().unwrap_or_else(|| usage()),
             "--help" | "-h" => help(),
+            "--version" | "-V" => version(),
             _ => inputs.push(a),
         }
     }

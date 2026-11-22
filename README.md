@@ -1,7 +1,7 @@
 # prev
 
-[![build](https://github.com/AnabasisXu/mdx-preview/actions/workflows/build.yml/badge.svg)](https://github.com/AnabasisXu/mdx-preview/actions/workflows/build.yml)
-[![release](https://img.shields.io/github/v/release/AnabasisXu/mdx-preview?display_name=tag)](https://github.com/AnabasisXu/mdx-preview/releases)
+[![build](https://github.com/AnabasisXu/prev/actions/workflows/build.yml/badge.svg)](https://github.com/AnabasisXu/prev/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/AnabasisXu/prev?display_name=tag)](https://github.com/AnabasisXu/prev/releases)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 
 单文件 MDict（`.mdx` / `.mdd`）浏览器，inspired by [Preview - 修改MDX CSS的神器，支持CSSJS实时预览](https://forum.freemdict.com/t/topic/1251)

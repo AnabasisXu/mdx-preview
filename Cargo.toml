@@ -1,10 +1,10 @@
 [package]
-name = "mdx-preview"
+name = "prev"
 version = "0.2.1"
 edition = "2021"
 description = "Single-file MDict (.mdx/.mdd) viewer with multi-dictionary support"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/AnabasisXu/mdx-preview"
+repository = "https://github.com/AnabasisXu/prev"
 readme = "README.md"
 
 [[bin]]

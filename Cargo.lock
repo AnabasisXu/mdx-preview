@@ -778,23 +778,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "mdx-preview"
-version = "0.2.1"
-dependencies = [
- "actix-web",
- "actix-ws",
- "encoding_rs",
- "flate2",
- "futures-util",
- "memmap2",
- "notify",
- "percent-encoding",
- "ripemd",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -935,6 +918,23 @@ name = "powerfmt"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
+
+[[package]]
+name = "prev"
+version = "0.2.1"
+dependencies = [
+ "actix-web",
+ "actix-ws",
+ "encoding_rs",
+ "flate2",
+ "futures-util",
+ "memmap2",
+ "notify",
+ "percent-encoding",
+ "ripemd",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "proc-macro2"

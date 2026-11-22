@@ -1,12 +1,12 @@
 # prev
 
-单文件 MDict（`.mdx` / `.mdd`）浏览器预览器：一个可执行文件内嵌解析器、HTTP/WebSocket 服务与前端，用浏览器读词典。
+单文件 MDict（`.mdx` / `.mdd`）浏览器，inspired by [Preview - 修改MDX CSS的神器，支持CSSJS实时预览](https://forum.freemdict.com/t/topic/1251)
 
-- 词表常驻左侧，滚动分页；输入即过滤，命中高亮
-- 词条正文在右侧 iframe 中渲染，`.mdd` 里的 CSS / JS / 图片按需取用
-- 支持 MDict v1.x / v2.0、`Encrypted=2`、UTF-8 / UTF-16 / GBK 等编码、`@@@LINK=` 重定向
-- 一次可加载多部词典（文件或目录），按词典切换浏览；词表索引按词典惰性构建
-- 记录块内存映射 + 按需解压，常驻内存接近文件大小
+## 与 Preview 的关系
+
+本项目起源于对 Preview 0.1.8 的静态逆向与协议重建：沿用它的路由家族（`/api/parser`、`/api/item`、`/api/lookup`、`/api/static`、`/api/v1/ws/`、`/dist`）、WebSocket RPC 与词条模板占位符，之后重写解析器、改为单文件 CLI，并加入多词典与惰性索引。反编译无法恢复原版源码，函数体是重建的。
+
+当前版本**尚未**对齐 Preview 的几个功能：同目录 CSS/JS 文件监听与实时预览、拼写提示下拉、多端搜索结果同步（这里只同步“打开词条”）、`entry://` 词条链接跳转；随机词头由 F5 触发，刷新页面不会自动换词。
 
 ## 快速开始
 

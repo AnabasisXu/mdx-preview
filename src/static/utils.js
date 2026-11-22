@@ -942,6 +942,23 @@ window.addEventListener('DOMContentLoaded', function () {
     load_status();
     // GoldenDict-style: the whole headword list is browsable before typing.
     search('');
+    // Surfingkeys (and similar tools) blur editable elements that were not
+    // focused by a real gesture unless this flag is set.
+    els.query.enableAutoFocus = true;
+    els.dictFilter.enableAutoFocus = true;
     els.query.focus();
     setTimeout(function () { els.query.focus(); }, 0);
+    // One real gesture is enough to let the caret into the search box even
+    // when the browser refuses page-load focus.
+    (function arm() {
+        function once() {
+            document.removeEventListener('pointerdown', once, true);
+            document.removeEventListener('keydown', once, true);
+            if (els.dictPop.hidden && document.activeElement !== els.query) {
+                els.query.focus();
+            }
+        }
+        document.addEventListener('pointerdown', once, true);
+        document.addEventListener('keydown', once, true);
+    })();
 });

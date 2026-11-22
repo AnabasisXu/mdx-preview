@@ -578,11 +578,27 @@ function bind_events() {
     });
 
     document.addEventListener('keydown', function (e) {
-        if (!els.dictPop.hidden && e.key === 'Escape') {
-            e.preventDefault();
-            close_dict_pop();
-            els.query.focus();
-            return;
+        if (!els.dictPop.hidden) {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                close_dict_pop();
+                els.query.focus();
+                return;
+            }
+            // If the browser's own default action (or anything else) took the
+            // caret out of the filter, keep arrows/Enter working on the picker.
+            if (document.activeElement !== els.dictFilter) {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    dict_pop_move(e.key === 'ArrowDown' ? 1 : -1);
+                    return;
+                }
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    dict_pop_choose();
+                    return;
+                }
+            }
         }
         if (e.key === 'F5') {
             e.preventDefault();
@@ -734,6 +750,11 @@ function toggle_dict_pop() {
 }
 
 function open_dict_pop() {
+    // Ctrl+P can arrive before /api/parser has answered; try again once.
+    if (!state.dicts.length) {
+        setTimeout(open_dict_pop, 150);
+        return;
+    }
     if (state.dicts.length < 2) return;
     dictPopSel = 0;
     els.dictFilter.value = '';
@@ -747,10 +768,13 @@ function open_dict_pop() {
     els.dictPop.style.top = (els.dictRow.offsetTop + els.dictRow.offsetHeight) + 'px';
     els.dictFilter.focus();
     // Some browsers finish their own default action after this handler and
-    // steal focus back; take it again on the next task.
-    setTimeout(function () {
+    // steal focus back; retry a few times instead of once.
+    var tries = 0;
+    (function focus_filter() {
+        if (els.dictPop.hidden || document.activeElement === els.dictFilter) return;
         try { els.dictFilter.focus(); } catch (e) { }
-    }, 0);
+        if (++tries < 4) setTimeout(focus_filter, 80);
+    })();
 }
 
 function close_dict_pop() {

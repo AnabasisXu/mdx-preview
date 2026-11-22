@@ -1538,15 +1538,23 @@ async fn main() -> std::io::Result<()> {
 
     let (tx, _rx) = broadcast::channel(32);
     let state = web::Data::new(AppState { dicts, tx });
-    println!("listening on http://127.0.0.1:{port}{base}/");
-    HttpServer::new(move || {
+    let listening = format!("listening on http://127.0.0.1:{port}{base}/");
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .configure(root)
             .service(web::scope(base.as_str()).configure(routes))
             .default_service(web::to(fallback))
     })
-    .bind(("127.0.0.1", port))?
-    .run()
-    .await
+    .bind(("127.0.0.1", port));
+    let server = match server {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!("prev: cannot listen on 127.0.0.1:{port}: {e}");
+            eprintln!("prev: another instance is probably using that port; try --port N");
+            std::process::exit(1);
+        }
+    };
+    println!("{listening}");
+    server.run().await
 }

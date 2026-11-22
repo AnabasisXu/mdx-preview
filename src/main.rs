@@ -6,6 +6,7 @@
 //! Everything is in this one binary: the MDX v2 reader, the embedded web UI,
 //! and the HTTP/WebSocket server.
 
+use actix_web::http::StatusCode;
 use actix_web::{get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_ws::Message;
 use encoding_rs::Encoding;
@@ -14,12 +15,12 @@ use futures_util::StreamExt;
 use memmap2::Mmap;
 use ripemd::{Digest, Ripemd128};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use tokio::sync::broadcast;
 
 const INDEX_HTML: &str = include_str!("static/index.html");
@@ -67,6 +68,23 @@ fn be_u64(d: &[u8], i: usize) -> u64 {
 }
 fn le_u32(d: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]])
+}
+fn truncated() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "truncated container")
+}
+fn need(d: &[u8], at: usize, n: usize) -> io::Result<()> {
+    match at.checked_add(n) {
+        Some(end) if end <= d.len() => Ok(()),
+        _ => Err(truncated()),
+    }
+}
+fn be_u16_at(d: &[u8], i: usize) -> io::Result<usize> {
+    need(d, i, 2)?;
+    Ok(be_u16(d, i) as usize)
+}
+fn le_u32_at(d: &[u8], i: usize) -> io::Result<u32> {
+    need(d, i, 4)?;
+    Ok(le_u32(d, i))
 }
 fn unzlib(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -139,17 +157,18 @@ fn parse_header(text: &str) -> HashMap<String, String> {
 }
 
 /// Read one number whose width depends on the container version.
-fn read_num(d: &[u8], p: &mut usize, width: usize) -> u64 {
+fn read_num(d: &[u8], p: &mut usize, width: usize) -> io::Result<u64> {
+    let end = p
+        .checked_add(width)
+        .filter(|e| *e <= d.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated container"))?;
     let v = if width == 8 {
-        let v = be_u64(d, *p);
-        *p += 8;
-        v
+        be_u64(d, *p)
     } else {
-        let v = be_u32(d, *p) as u64;
-        *p += 4;
-        v
+        be_u32(d, *p) as u64
     };
-    v
+    *p = end;
+    Ok(v)
 }
 
 struct RecordBlock {
@@ -158,23 +177,66 @@ struct RecordBlock {
     decomp: usize,
 }
 
-/// Memory-mapped .mdx with lazy record decompression. Keeping only the map and
-/// the key index makes resident memory track the file size instead of the much
-/// larger decompressed text.
-struct Mdx {
-    map: Mmap,
-    blocks: Vec<RecordBlock>,
-    starts: Vec<u64>,
-    ends: Vec<u64>,
+/// Decompressed key section: headwords, lookup order, record offsets, and the
+/// lowercased forms used for filtering.
+struct KeyIndex {
     words: Vec<String>,
     /// Entry ids sorted by headword, for `@@@LINK=` lookups.
     sorted: Vec<u32>,
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    /// Lowercased headwords, computed once so filtering never allocates per word.
+    lower: Vec<String>,
+}
+
+impl KeyIndex {
+    fn find(&self, word: &str) -> Option<usize> {
+        self.sorted
+            .binary_search_by(|id| self.words[*id as usize].as_str().cmp(word))
+            .ok()
+            .map(|pos| self.sorted[pos] as usize)
+    }
+}
+
+/// Where the key section lives in the mapped file.
+struct MdxLayout {
+    width: usize,
+    version2: bool,
+    is_utf16: bool,
+    /// `Encrypted=2`: the key block info is obfuscated.
+    encrypt2: bool,
+    kb_info_span: (usize, usize),
+    kb_comp_span: (usize, usize),
+}
+
+/// Memory-mapped .mdx. Opening parses the header and the record-block table
+/// only; the key section is decompressed on first use so a directory of
+/// dictionaries stays cheap until one is actually browsed.
+struct Mdx {
+    map: Mmap,
     codec: Option<&'static Encoding>,
+    num_entries: u64,
+    layout: MdxLayout,
+    /// Sum of the decompressed record sizes, the last entry's end offset.
+    record_total: u64,
+    blocks: Vec<RecordBlock>,
+    index: OnceLock<Result<KeyIndex, String>>,
 }
 
 impl Mdx {
     fn decompress(&self, b: &RecordBlock) -> io::Result<Vec<u8>> {
-        let buf = &self.map[b.offset..b.offset + b.comp];
+        let end = b
+            .offset
+            .checked_add(b.comp)
+            .filter(|e| *e <= self.map.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record block outside file"))?;
+        let buf = &self.map[b.offset..end];
+        if buf.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated record block",
+            ));
+        }
         match le_u32(buf, 0) {
             0 => Ok(buf[8..].to_vec()),
             2 => unzlib(&buf[8..]),
@@ -208,49 +270,186 @@ impl Mdx {
         Ok(out)
     }
 
-    fn text_at(&self, idx: usize) -> Option<String> {
-        let start = *self.starts.get(idx)? as usize;
-        let end = *self.ends.get(idx)? as usize;
+    /// Decompress the key section on first use; failures are cached too.
+    fn index(&self) -> Result<&KeyIndex, String> {
+        self.index
+            .get_or_init(|| self.build_index().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|e| e.clone())
+    }
+
+    fn build_index(&self) -> io::Result<KeyIndex> {
+        let d: &[u8] = &self.map;
+        let width = self.layout.width;
+        let (info_off, info_len) = self.layout.kb_info_span;
+        let kb_info_raw = &d[info_off..info_off + info_len];
+        let kb_info = if self.layout.version2 {
+            let block = if self.layout.encrypt2 {
+                mdx_decrypt(kb_info_raw)
+            } else {
+                kb_info_raw.to_vec()
+            };
+            if block.len() < 8 {
+                return Err(truncated());
+            }
+            unzlib(&block[8..])?
+        } else {
+            kb_info_raw.to_vec()
+        };
+
+        let mut comps: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < kb_info.len() {
+            let _n = read_num(&kb_info, &mut i, width)?;
+            let head_size = if self.layout.version2 {
+                let s = be_u16_at(&kb_info, i)?;
+                i += 2;
+                s
+            } else {
+                let s = *kb_info.get(i).ok_or_else(truncated)? as usize;
+                i += 1;
+                s
+            };
+            i += if self.layout.is_utf16 {
+                (head_size + 1) * 2
+            } else {
+                head_size + 1
+            };
+            let tail_size = if self.layout.version2 {
+                let s = be_u16_at(&kb_info, i)?;
+                i += 2;
+                s
+            } else {
+                let s = *kb_info.get(i).ok_or_else(truncated)? as usize;
+                i += 1;
+                s
+            };
+            i += if self.layout.is_utf16 {
+                (tail_size + 1) * 2
+            } else {
+                tail_size + 1
+            };
+            let comp = read_num(&kb_info, &mut i, width)? as usize;
+            let _decomp = read_num(&kb_info, &mut i, width)?;
+            comps.push(comp);
+        }
+
+        let (kb_off, kb_len) = self.layout.kb_comp_span;
+        let kb_comp = &d[kb_off..kb_off + kb_len];
+
+        let mut keys: Vec<(u64, String)> = Vec::new();
+        let mut off = 0;
+        for comp in comps {
+            let kind = le_u32_at(kb_comp, off)?;
+            let end = off
+                .checked_add(comp)
+                .filter(|e| *e <= kb_comp.len())
+                .ok_or_else(truncated)?;
+            if end < off + 8 {
+                return Err(truncated());
+            }
+            let body = &kb_comp[off + 8..end];
+            let block = match kind {
+                0 => body.to_vec(),
+                2 => unzlib(body)?,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "LZO compression is not supported",
+                    ))
+                }
+            };
+            let mut j = 0;
+            while j < block.len() {
+                let key_id = read_num(&block, &mut j, width)?;
+                let start = j;
+                let word;
+                if self.layout.is_utf16 {
+                    let mut k = j;
+                    while k + 1 < block.len() && !(block[k] == 0 && block[k + 1] == 0) {
+                        k += 2;
+                    }
+                    word = utf16le(&block[start..k]);
+                    j = k + 2;
+                } else {
+                    let mut k = j;
+                    while k < block.len() && block[k] != 0 {
+                        k += 1;
+                    }
+                    word = decode(&block[start..k], self.codec);
+                    j = k + 1;
+                }
+                keys.push((key_id, word));
+            }
+            off += comp;
+        }
+
+        let mut starts = Vec::with_capacity(keys.len());
+        let mut ends = Vec::with_capacity(keys.len());
+        for idx in 0..keys.len() {
+            starts.push(keys[idx].0);
+            ends.push(if idx + 1 < keys.len() {
+                keys[idx + 1].0
+            } else {
+                self.record_total
+            });
+        }
+        let words: Vec<String> = keys.into_iter().map(|(_, word)| word).collect();
+        let mut sorted: Vec<u32> = (0..words.len() as u32).collect();
+        sorted.sort_by(|a, b| words[*a as usize].cmp(&words[*b as usize]));
+        let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+        Ok(KeyIndex {
+            words,
+            sorted,
+            starts,
+            ends,
+            lower,
+        })
+    }
+
+    fn text_at(&self, idx: usize, index: &KeyIndex) -> Option<String> {
+        let start = *index.starts.get(idx)? as usize;
+        let end = *index.ends.get(idx)? as usize;
         let raw = self.raw(start, end).ok()?;
         let text = decode(&raw, self.codec);
         Some(text.trim_end_matches('\0').to_string())
     }
 
     /// Entry text with `@@@LINK=` redirects followed (bounded, cycle-safe).
-    fn text(&self, id: u32) -> Option<String> {
-        let idx = (id as usize).checked_sub(1)?;
+    fn text(&self, id: u32) -> Result<Option<String>, String> {
+        let Some(idx) = (id as usize).checked_sub(1) else {
+            return Ok(None);
+        };
+        let index = self.index()?;
         let mut cur = idx;
         for _ in 0..16 {
-            let text = self.text_at(cur)?;
+            let Some(text) = self.text_at(cur, index) else {
+                return Ok(None);
+            };
             let Some(target) = text.trim().strip_prefix("@@@LINK=") else {
-                return Some(text);
+                return Ok(Some(text));
             };
             let target = target.trim();
-            match self.find(target) {
+            match index.find(target) {
                 Some(next) if next != cur => cur = next,
-                _ => return Some(text),
+                _ => return Ok(Some(text)),
             }
         }
-        self.text_at(idx)
+        Ok(self.text_at(idx, index))
     }
 
-    fn find(&self, word: &str) -> Option<usize> {
-        self.sorted
-            .binary_search_by(|id| self.words[*id as usize].as_str().cmp(word))
-            .ok()
-            .map(|pos| self.sorted[pos] as usize)
-    }
-
-    fn word(&self, id: u32) -> Option<&str> {
-        (id as usize)
+    fn word(&self, id: u32) -> Result<Option<&str>, String> {
+        let index = self.index()?;
+        Ok((id as usize)
             .checked_sub(1)
-            .and_then(|i| self.words.get(i))
-            .map(String::as_str)
+            .and_then(|i| index.words.get(i))
+            .map(String::as_str))
     }
 }
 
-/// Parse an .mdx container into an index plus its record blocks.
-fn load_mdx(path: &str) -> io::Result<Mdx> {
+/// Open an .mdx container: header and record-block table only. The key section
+/// is left compressed until `index()` is called.
+fn open(path: &Path) -> io::Result<Mdx> {
     let file = File::open(path)?;
     let map = unsafe { Mmap::map(&file)? };
     let d: &[u8] = &map;
@@ -258,6 +457,9 @@ fn load_mdx(path: &str) -> io::Result<Mdx> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
     }
     let hlen = be_u32(&d, 0) as usize;
+    if hlen < 2 || 4 + hlen > d.len() {
+        return Err(truncated());
+    }
     let header = utf16le(&d[4..4 + hlen]);
     let h = parse_header(&header);
     let encoding = h.get("Encoding").cloned().unwrap_or_else(|| "UTF-8".into());
@@ -286,28 +488,28 @@ fn load_mdx(path: &str) -> io::Result<Mdx> {
     }
 
     // --- key section
-    let num_key_blocks = read_num(&d, &mut p, width);
-    let _num_entries = read_num(&d, &mut p, width);
+    need(&d, p, 4 * width + 4)?;
+    let _num_key_blocks = read_num(&d, &mut p, width)?;
+    let num_entries = read_num(&d, &mut p, width)?;
     if version >= 2.0 {
-        let _kb_info_decomp = read_num(&d, &mut p, width);
+        let _kb_info_decomp = read_num(&d, &mut p, width)?;
     }
-    let kb_info_size = read_num(&d, &mut p, width) as usize;
-    let kb_size = read_num(&d, &mut p, width) as usize;
+    let kb_info_size = read_num(&d, &mut p, width)? as usize;
+    let kb_size = read_num(&d, &mut p, width)? as usize;
     if version >= 2.0 {
         p += 4; // adler32 of the five numbers
     }
-    let kb_info_raw = &d[p..p + kb_info_size];
+    let _key_end = p
+        .checked_add(kb_info_size)
+        .and_then(|v| v.checked_add(kb_size))
+        .filter(|e| *e <= d.len())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "key section lies outside the file")
+        })?;
+    let kb_info_span = (p, kb_info_size);
     p += kb_info_size;
-    let kb_info = if version >= 2.0 {
-        let block = if encrypt & 2 != 0 {
-            mdx_decrypt(kb_info_raw)
-        } else {
-            kb_info_raw.to_vec()
-        };
-        unzlib(&block[8..])?
-    } else {
-        kb_info_raw.to_vec()
-    };
+    let kb_comp_span = (p, kb_size);
+    p += kb_size;
 
     let is_utf16 = encoding.eq_ignore_ascii_case("UTF-16");
     let codec = if is_utf16 {
@@ -316,101 +518,32 @@ fn load_mdx(path: &str) -> io::Result<Mdx> {
         Encoding::for_label(encoding.as_bytes())
     };
 
-    let mut blocks: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < kb_info.len() {
-        let _n = read_num(&kb_info, &mut i, width);
-        let head_size = if version >= 2.0 {
-            let s = be_u16(&kb_info, i) as usize;
-            i += 2;
-            s
-        } else {
-            let s = kb_info[i] as usize;
-            i += 1;
-            s
-        };
-        i += if is_utf16 {
-            (head_size + 1) * 2
-        } else {
-            head_size + 1
-        };
-        let tail_size = if version >= 2.0 {
-            let s = be_u16(&kb_info, i) as usize;
-            i += 2;
-            s
-        } else {
-            let s = kb_info[i] as usize;
-            i += 1;
-            s
-        };
-        i += if is_utf16 {
-            (tail_size + 1) * 2
-        } else {
-            tail_size + 1
-        };
-        let comp = read_num(&kb_info, &mut i, width) as usize;
-        let _decomp = read_num(&kb_info, &mut i, width);
-        blocks.push((comp, 0));
-    }
-    let _ = num_key_blocks;
-
-    let kb_comp = &d[p..p + kb_size];
-    p += kb_size;
-
-    let mut keys: Vec<(u64, String)> = Vec::new();
-    let mut off = 0;
-    for (comp, _) in &blocks {
-        let kind = le_u32(kb_comp, off);
-        let body = &kb_comp[off + 8..off + comp];
-        let block = match kind {
-            0 => body.to_vec(),
-            2 => unzlib(body)?,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "LZO compression is not supported",
-                ))
-            }
-        };
-        let mut j = 0;
-        while j < block.len() {
-            let key_id = read_num(&block, &mut j, width);
-            let start = j;
-            let word;
-            if is_utf16 {
-                let mut k = j;
-                while k + 1 < block.len() && !(block[k] == 0 && block[k + 1] == 0) {
-                    k += 2;
-                }
-                word = utf16le(&block[start..k]);
-                j = k + 2;
-            } else {
-                let mut k = j;
-                while k < block.len() && block[k] != 0 {
-                    k += 1;
-                }
-                word = decode(&block[start..k], codec);
-                j = k + 1;
-            }
-            keys.push((key_id, word));
-        }
-        off += comp;
-    }
-
     // --- record section
-    let num_record_blocks = read_num(&d, &mut p, width);
-    let _num_entries2 = read_num(&d, &mut p, width);
-    let _rb_info_size = read_num(&d, &mut p, width);
-    let _rb_size = read_num(&d, &mut p, width);
+    need(&d, p, 4 * width)?;
+    let num_record_blocks = read_num(&d, &mut p, width)?;
+    let table = num_record_blocks
+        .checked_mul(2 * width as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .and_then(|n| p.checked_add(n))
+        .filter(|e| *e <= d.len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record block table lies outside the file",
+            )
+        })?;
+    let _num_entries2 = read_num(&d, &mut p, width)?;
+    let _rb_info_size = read_num(&d, &mut p, width)?;
+    let _rb_size = read_num(&d, &mut p, width)?;
     let mut info: Vec<(usize, usize)> = Vec::new();
     for _ in 0..num_record_blocks {
-        let comp = read_num(&d, &mut p, width) as usize;
-        let decomp = read_num(&d, &mut p, width) as usize;
+        let comp = read_num(&d, &mut p, width)? as usize;
+        let decomp = read_num(&d, &mut p, width)? as usize;
         info.push((comp, decomp));
     }
 
     let mut blocks = Vec::with_capacity(info.len());
-    let mut offset = p;
+    let mut offset = table;
     for (comp, decomp) in info {
         blocks.push(RecordBlock {
             offset,
@@ -421,30 +554,21 @@ fn load_mdx(path: &str) -> io::Result<Mdx> {
     }
     let total: u64 = blocks.iter().map(|b| b.decomp as u64).sum();
 
-    let mut starts = Vec::with_capacity(keys.len());
-    let mut ends = Vec::with_capacity(keys.len());
-    for idx in 0..keys.len() {
-        starts.push(keys[idx].0);
-        ends.push(if idx + 1 < keys.len() {
-            keys[idx + 1].0
-        } else {
-            total
-        });
-    }
-    let mut words = Vec::with_capacity(keys.len());
-    for (_, word) in keys {
-        words.push(word);
-    }
-    let mut sorted: Vec<u32> = (0..words.len() as u32).collect();
-    sorted.sort_by(|a, b| words[*a as usize].cmp(&words[*b as usize]));
     Ok(Mdx {
         map,
-        blocks,
-        starts,
-        ends,
-        words,
-        sorted,
         codec,
+        num_entries,
+        layout: MdxLayout {
+            width,
+            version2: version >= 2.0,
+            is_utf16,
+            encrypt2: encrypt & 2 != 0,
+            kb_info_span,
+            kb_comp_span,
+        },
+        record_total: total,
+        blocks,
+        index: OnceLock::new(),
     })
 }
 
@@ -470,6 +594,9 @@ impl Mdd {
         f.seek(SeekFrom::Start(b.offset))?;
         let mut buf = vec![0u8; b.comp];
         f.read_exact(&mut buf)?;
+        if buf.len() < 8 {
+            return Err(truncated());
+        }
         match le_u32(&buf, 0) {
             0 => Ok(buf[8..].to_vec()),
             2 => unzlib(&buf[8..]),
@@ -569,35 +696,38 @@ fn load_mdd(path: &Path) -> io::Result<Mdd> {
         if encrypt & 2 != 0 {
             kb_info = mdx_decrypt(&kb_info);
         }
+        if kb_info.len() < 8 {
+            return Err(truncated());
+        }
         kb_info = unzlib(&kb_info[8..])?;
     }
 
     let mut sizes: Vec<(usize, usize)> = Vec::with_capacity(num_key_blocks as usize);
     let mut i = 0;
     while i < kb_info.len() {
-        read_num(&kb_info, &mut i, width); // entries in this key block
+        read_num(&kb_info, &mut i, width)?; // entries in this key block
         let hs = if version >= 2.0 {
-            let s = be_u16(&kb_info, i) as usize;
+            let s = be_u16_at(&kb_info, i)?;
             i += 2;
             s
         } else {
-            let s = kb_info[i] as usize;
+            let s = *kb_info.get(i).ok_or_else(truncated)? as usize;
             i += 1;
             s
         };
         i += (hs + term) * 2;
         let ts = if version >= 2.0 {
-            let s = be_u16(&kb_info, i) as usize;
+            let s = be_u16_at(&kb_info, i)?;
             i += 2;
             s
         } else {
-            let s = kb_info[i] as usize;
+            let s = *kb_info.get(i).ok_or_else(truncated)? as usize;
             i += 1;
             s
         };
         i += (ts + term) * 2;
-        let comp = read_num(&kb_info, &mut i, width) as usize;
-        let decomp = read_num(&kb_info, &mut i, width) as usize;
+        let comp = read_num(&kb_info, &mut i, width)? as usize;
+        let decomp = read_num(&kb_info, &mut i, width)? as usize;
         sizes.push((comp, decomp));
     }
 
@@ -605,8 +735,15 @@ fn load_mdd(path: &Path) -> io::Result<Mdd> {
     let mut keys: Vec<(usize, String)> = Vec::new();
     let mut off = 0;
     for (comp, _) in &sizes {
-        let kind = le_u32(&kb, off);
-        let body = &kb[off + 8..off + comp];
+        let kind = le_u32_at(&kb, off)?;
+        let end = off
+            .checked_add(*comp)
+            .filter(|e| *e <= kb.len())
+            .ok_or_else(truncated)?;
+        if end < off + 8 {
+            return Err(truncated());
+        }
+        let body = &kb[off + 8..end];
         let block = match kind {
             0 => body.to_vec(),
             2 => unzlib(body)?,
@@ -619,7 +756,7 @@ fn load_mdd(path: &Path) -> io::Result<Mdd> {
         };
         let mut j = 0;
         while j < block.len() {
-            let key_id = read_num(&block, &mut j, width) as usize;
+            let key_id = read_num(&block, &mut j, width)? as usize;
             let start = j;
             let mut k = j;
             while k + 1 < block.len() && !(block[k] == 0 && block[k + 1] == 0) {
@@ -677,8 +814,7 @@ fn load_mdd(path: &Path) -> io::Result<Mdd> {
 }
 
 /// `dict.mdx` owns `dict.mdd` plus optional `dict.1.mdd`, `dict.2.mdd`, ...
-fn mdd_candidates(mdx: &str) -> Vec<PathBuf> {
-    let p = Path::new(mdx);
+fn mdd_candidates(p: &Path) -> Vec<PathBuf> {
     let dir = match p.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
@@ -720,7 +856,13 @@ struct Resource {
     end: usize,
 }
 
-fn load_resources(mdx: &str) -> (Vec<Mdd>, HashMap<String, Resource>) {
+/// A dictionary's .mdd archives, indexed on first resource request.
+struct Resources {
+    mdds: Vec<Mdd>,
+    map: HashMap<String, Resource>,
+}
+
+fn load_resources(mdx: &Path) -> Resources {
     let mut mdds = Vec::new();
     let mut map = HashMap::new();
     for path in mdd_candidates(mdx) {
@@ -739,24 +881,55 @@ fn load_resources(mdx: &str) -> (Vec<Mdd>, HashMap<String, Resource>) {
             Err(e) => eprintln!("prev: skipping {}: {e}", path.display()),
         }
     }
-    (mdds, map)
+    Resources { mdds, map }
 }
 
 // ---------------------------------------------------------------- web layer
 
 struct Dict {
-    /// Headwords live in the mapped file's index; a word's id is its index + 1.
+    id: usize,
+    /// File name without extension, shown in the picker and status bar.
+    name: String,
+    path: PathBuf,
     mdx: Mdx,
-    /// Lowercased headwords, computed once so filtering never allocates per word.
-    lower: Vec<String>,
     /// Jump bar buckets: (label, first index, last index) in file order.
-    initials: Vec<(String, usize, usize)>,
+    initials: OnceLock<Vec<(String, usize, usize)>>,
+    /// .mdd archives, indexed on first resource request.
+    resources: OnceLock<Resources>,
 }
 
 impl Dict {
-    fn page<I: Iterator<Item = usize>>(
+    fn new(id: usize, path: PathBuf, mdx: Mdx) -> Dict {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        Dict {
+            id,
+            name,
+            path,
+            mdx,
+            initials: OnceLock::new(),
+            resources: OnceLock::new(),
+        }
+    }
+
+    /// Header-declared entry count; once the key index exists, the real count.
+    fn count(&self) -> usize {
+        match self.mdx.index.get() {
+            Some(Ok(index)) => index.words.len(),
+            _ => self.mdx.num_entries as usize,
+        }
+    }
+
+    fn index(&self) -> Result<&KeyIndex, String> {
+        self.mdx.index()
+    }
+
+    fn page(
         &self,
-        idxs: I,
+        index: &KeyIndex,
+        idxs: impl Iterator<Item = usize>,
         q: &str,
         offset: usize,
         limit: usize,
@@ -765,7 +938,7 @@ impl Dict {
         let mut skipped = 0;
         let mut has_more = false;
         for i in idxs {
-            if !q.is_empty() && !self.lower[i].contains(q) {
+            if !q.is_empty() && !index.lower[i].contains(q) {
                 continue;
             }
             if skipped < offset {
@@ -773,7 +946,7 @@ impl Dict {
                 continue;
             }
             if items.len() < limit {
-                items.push((self.mdx.words[i].clone(), (i + 1) as u32));
+                items.push((index.words[i].clone(), (i + 1) as u32));
             } else {
                 has_more = true;
                 break;
@@ -788,21 +961,35 @@ impl Dict {
         offset: usize,
         limit: usize,
         desc: bool,
-    ) -> (Vec<(String, u32)>, bool) {
+    ) -> Result<(Vec<(String, u32)>, bool), String> {
+        let index = self.index()?;
         let q = q.to_lowercase();
-        if desc {
-            self.page((0..self.mdx.words.len()).rev(), &q, offset, limit)
+        let (items, has_more) = if desc {
+            self.page(index, (0..index.words.len()).rev(), &q, offset, limit)
         } else {
-            self.page(0..self.mdx.words.len(), &q, offset, limit)
-        }
+            self.page(index, 0..index.words.len(), &q, offset, limit)
+        };
+        Ok((items, has_more))
     }
 
-    fn word(&self, id: u32) -> Option<&str> {
+    fn word(&self, id: u32) -> Result<Option<&str>, String> {
         self.mdx.word(id)
     }
 
-    fn text(&self, id: u32) -> Option<String> {
+    fn text(&self, id: u32) -> Result<Option<String>, String> {
         self.mdx.text(id)
+    }
+
+    fn initials(&self) -> Result<&Vec<(String, usize, usize)>, String> {
+        if let Some(v) = self.initials.get() {
+            return Ok(v);
+        }
+        let words = &self.index()?.words;
+        Ok(self.initials.get_or_init(|| build_initials(words)))
+    }
+
+    fn resources(&self) -> &Resources {
+        self.resources.get_or_init(|| load_resources(&self.path))
     }
 }
 
@@ -856,12 +1043,8 @@ fn rand_index(n: usize) -> usize {
 }
 
 struct AppState {
-    dict: Arc<Dict>,
-    mdds: Vec<Mdd>,
-    res: HashMap<String, Resource>,
+    dicts: Vec<Dict>,
     tx: broadcast::Sender<String>,
-    /// Dictionary file name without extension, shown in the status bar.
-    name: String,
 }
 
 #[get("/")]
@@ -897,38 +1080,66 @@ fn root(cfg: &mut web::ServiceConfig) {
     }
 }
 
-fn render_item(title: &str, body_html: &str) -> String {
+fn render_item(dict: &Dict, title: &str, body_html: &str) -> String {
     ITEM_HTML
-        .replace("{base}", base())
+        .replace("{res}", &format!("{}/api/d/{}/res/", base(), dict.id))
         .replace("{title}", title)
         .replace("{attributes}", body_html)
 }
 
-#[get("/api/parser")]
-async fn parser(state: web::Data<AppState>) -> impl Responder {
-    HttpResponse::Ok().json(json!({
-        "name": state.name,
-        "count": state.dict.mdx.words.len(),
-    }))
+fn unknown_dict() -> HttpResponse {
+    HttpResponse::NotFound().body("unknown dictionary")
 }
 
-#[get("/api/item/{k_id}")]
-async fn item(k_id: web::Path<u32>, state: web::Data<AppState>) -> impl Responder {
-    let k_id = k_id.into_inner();
-    match state.dict.text(k_id) {
-        Some(text) => {
-            let title = state.dict.word(k_id).unwrap_or("");
+fn index_error(e: String) -> HttpResponse {
+    HttpResponse::InternalServerError().body(format!("INDEX_ERROR: {e}"))
+}
+
+#[get("/api/parser")]
+async fn parser(state: web::Data<AppState>) -> impl Responder {
+    let dicts: Vec<Value> = state
+        .dicts
+        .iter()
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "name": d.name,
+                "count": d.count(),
+                "path": d.path.to_string_lossy(),
+            })
+        })
+        .collect();
+    HttpResponse::Ok().json(json!({"dicts": dicts}))
+}
+
+#[get("/api/d/{dict}/item/{k_id}")]
+async fn item(path: web::Path<(usize, u32)>, state: web::Data<AppState>) -> impl Responder {
+    let (d, k_id) = path.into_inner();
+    let Some(dict) = state.dicts.get(d) else {
+        return unknown_dict();
+    };
+    match dict.text(k_id) {
+        Ok(Some(text)) => {
+            let title = dict.word(k_id).ok().flatten().unwrap_or("");
             HttpResponse::Ok()
                 .content_type("text/html; charset=utf-8")
-                .body(render_item(title, &text))
+                .body(render_item(dict, title, &text))
         }
-        None => HttpResponse::NotFound().body("404"),
+        Ok(None) => HttpResponse::NotFound().body("404"),
+        Err(e) => index_error(e),
     }
 }
-#[get("/api/lookup/{word}")]
-async fn lookup(word: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
-    let (hits, has_more) = state.dict.suggest_page(&word, 0, 20, false);
-    HttpResponse::Ok().json(json!({"items": hits, "has_more": has_more}))
+
+#[get("/api/d/{dict}/lookup/{word}")]
+async fn lookup(path: web::Path<(usize, String)>, state: web::Data<AppState>) -> impl Responder {
+    let (d, word) = path.into_inner();
+    let Some(dict) = state.dicts.get(d) else {
+        return unknown_dict();
+    };
+    match dict.suggest_page(&word, 0, 20, false) {
+        Ok((hits, has_more)) => HttpResponse::Ok().json(json!({"items": hits, "has_more": has_more})),
+        Err(e) => index_error(e),
+    }
 }
 
 #[get("/api/static/{path:.*}")]
@@ -943,15 +1154,16 @@ async fn static_file(path: web::Path<String>) -> impl Responder {
     }
 }
 
-fn serve_resource(rel: &str, state: &AppState) -> HttpResponse {
+fn serve_resource(dict: &Dict, rel: &str) -> HttpResponse {
     if rel.is_empty() || rel.contains("..") {
         return HttpResponse::NotFound().body("NOT_FOUND");
     }
     let key = norm_res(rel);
-    let Some(res) = state.res.get(&key) else {
+    let resources = dict.resources();
+    let Some(res) = resources.map.get(&key) else {
         return HttpResponse::NotFound().body("NOT_FOUND");
     };
-    match state.mdds[res.mdd].read(res.start, res.end) {
+    match resources.mdds[res.mdd].read(res.start, res.end) {
         Ok(bytes) => HttpResponse::Ok()
             .content_type(mime_of(&key))
             .insert_header(("Cache-Control", "public, max-age=3600"))
@@ -960,13 +1172,18 @@ fn serve_resource(rel: &str, state: &AppState) -> HttpResponse {
     }
 }
 
-#[get("/api/res/{path:.*}")]
-async fn res_file(path: web::Path<String>, state: web::Data<AppState>) -> impl Responder {
-    serve_resource(&path.into_inner(), &state)
+#[get("/api/d/{dict}/res/{path:.*}")]
+async fn res_file(path: web::Path<(usize, String)>, state: web::Data<AppState>) -> impl Responder {
+    let (d, rel) = path.into_inner();
+    let Some(dict) = state.dicts.get(d) else {
+        return unknown_dict();
+    };
+    serve_resource(dict, &rel)
 }
 
-/// Entries also reference resources with root-absolute paths (`/img.png`);
-/// anything no other route claimed is looked up in the .mdd archives.
+/// Entries also reference resources with root-absolute paths (`/img.png`),
+/// which carry no dictionary. Try the referring entry's dictionary first, then
+/// every dictionary in load order.
 async fn fallback(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     let decoded = percent_encoding::percent_decode_str(req.path()).decode_utf8_lossy();
     let mut rel = decoded.as_ref();
@@ -978,7 +1195,37 @@ async fn fallback(req: HttpRequest, state: web::Data<AppState>) -> impl Responde
             rel = rest;
         }
     }
-    serve_resource(rel, &state)
+    if rel.is_empty() || rel.contains("..") {
+        return HttpResponse::NotFound().body("NOT_FOUND");
+    }
+    let referer = req
+        .headers()
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(dict) = dict_from_referer(referer).and_then(|d| state.dicts.get(d)) {
+        let resp = serve_resource(dict, rel);
+        if resp.status() != StatusCode::NOT_FOUND {
+            return resp;
+        }
+    }
+    for dict in &state.dicts {
+        let resp = serve_resource(dict, rel);
+        if resp.status() != StatusCode::NOT_FOUND {
+            return resp;
+        }
+    }
+    HttpResponse::NotFound().body("NOT_FOUND")
+}
+
+/// Pull the dictionary id out of `/api/d/<n>/...` in a Referer URL.
+fn dict_from_referer(referer: &str) -> Option<usize> {
+    let at = referer.find("/api/d/")? + "/api/d/".len();
+    let digits: String = referer[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 #[get("/dist/{path:.*}")]
@@ -1033,12 +1280,24 @@ async fn ws(
     let (response, session, msg_stream) = actix_ws::handle(&req, body)?;
     let mut rx = state.tx.subscribe();
     let state2 = state.clone();
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
 
+    // Forward broadcasts until the peer goes away; without the stop signal this
+    // task would park on the broadcast forever and hold the connection open, so
+    // the server could not shut down gracefully while a tab was still attached.
     let mut out = session.clone();
     actix_web::rt::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if out.text(msg).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                msg = rx.recv() => match msg {
+                    Ok(msg) => {
+                        if out.text(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
             }
         }
     });
@@ -1046,74 +1305,24 @@ async fn ws(
     actix_web::rt::spawn(async move {
         let mut stream = msg_stream;
         while let Some(Ok(msg)) = stream.next().await {
+            if let Message::Close(_) = msg {
+                break;
+            }
             if let Message::Text(text) = msg {
                 if let Ok(req) = serde_json::from_str::<Value>(&text) {
                     let id = req.get("id").cloned().unwrap_or(Value::Null);
                     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     let params = req.get("params").cloned().unwrap_or(json!([]));
-                    let reply = match method {
-                        "suggest_words" => {
-                            let q = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
-                            let offset =
-                                params.get(1).and_then(|p| p.as_u64()).unwrap_or(0) as usize;
-                            let desc = params
-                                .get(2)
-                                .and_then(|p| p.as_bool())
-                                .unwrap_or(false);
-                            let (hits, has_more) =
-                                state2.dict.suggest_page(q, offset, 20, desc);
-                            let items: Vec<[Value; 2]> = hits
-                                .into_iter()
-                                .map(|(w, id)| [json!(w), json!(id)])
-                                .collect();
-                            json!({"id": id, "result": {"items": items, "has_more": has_more}, "error": null})
-                        }
-                        "load_text" => {
-                            let k = params.get(0).and_then(|p| p.as_u64()).unwrap_or(0) as u32;
-                            let text = state2.dict.text(k).unwrap_or_default();
-                            json!({"id": id, "result": text, "error": null})
-                        }
-                        "random" => {
-                            let n = state2.dict.mdx.words.len();
-                            let i = rand_index(n);
-                            json!({"id": id, "result": {
-                                "word": state2.dict.mdx.words[i],
-                                "k_id": (i + 1) as u32,
-                            }, "error": null})
-                        }
-                        "initials" => {
-                            json!({"id": id, "result": state2.dict.initials, "error": null})
-                        }
-                        "jump" => {
-                            let label = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
-                            let desc = params
-                                .get(1)
-                                .and_then(|p| p.as_bool())
-                                .unwrap_or(false);
-                            let n = state2.dict.mdx.words.len();
-                            let offset = state2
-                                .dict
-                                .initials
-                                .iter()
-                                .find(|(l, _, _)| l == label)
-                                .map(|(_, first, last)| {
-                                    if desc {
-                                        n.saturating_sub(1).saturating_sub(*last)
-                                    } else {
-                                        *first
-                                    }
-                                })
-                                .unwrap_or(0);
-                            json!({"id": id, "result": {"offset": offset}, "error": null})
-                        }
-                        "redirect" => {
-                            let k = params.get(0).cloned().unwrap_or(Value::Null);
-                            let _ = state2
-                                .tx
-                                .send(json!({"event": "redirect", "params": [k]}).to_string());
-                            json!({"id": id, "result": null, "error": null})
-                        }
-                        _ => json!({"id": id, "result": null, "error": "unknown method"}),
+                    let dict = req
+                        .get("dict")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| state2.dicts.get(v as usize));
+                    let reply = match dict {
+                        Some(dict) => match rpc_reply(&state2, dict, id.clone(), method, &params) {
+                            Ok(v) => v,
+                            Err(e) => json!({"id": id, "result": null, "error": e}),
+                        },
+                        None => json!({"id": id, "result": null, "error": "unknown dictionary"}),
                     };
                     if session.clone().text(reply.to_string()).await.is_err() {
                         break;
@@ -1121,16 +1330,81 @@ async fn ws(
                 }
             }
         }
+        let _ = stop_tx.send(());
     });
     Ok(response)
+}
+
+/// One WebSocket request; errors become the reply's `error` field.
+fn rpc_reply(
+    state: &AppState,
+    dict: &Dict,
+    id: Value,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    let ok = |result: Value| json!({"id": id.clone(), "result": result, "error": null});
+    match method {
+        "suggest_words" => {
+            let q = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
+            let offset = params.get(1).and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+            let desc = params.get(2).and_then(|p| p.as_bool()).unwrap_or(false);
+            let (hits, has_more) = dict.suggest_page(q, offset, 20, desc)?;
+            let items: Vec<[Value; 2]> = hits
+                .into_iter()
+                .map(|(w, k)| [json!(w), json!(k)])
+                .collect();
+            Ok(ok(json!({"items": items, "has_more": has_more})))
+        }
+        "load_text" => {
+            let k = params.get(0).and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+            Ok(ok(json!(dict.text(k)?.unwrap_or_default())))
+        }
+        "random" => {
+            let index = dict.index()?;
+            let i = rand_index(index.words.len());
+            Ok(ok(json!({
+                "word": index.words[i],
+                "k_id": (i + 1) as u32,
+            })))
+        }
+        "initials" => Ok(ok(json!(dict.initials()?))),
+        "jump" => {
+            let label = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
+            let desc = params.get(1).and_then(|p| p.as_bool()).unwrap_or(false);
+            let n = dict.index()?.words.len();
+            let offset = dict
+                .initials()?
+                .iter()
+                .find(|(l, _, _)| l == label)
+                .map(|(_, first, last)| {
+                    if desc {
+                        n.saturating_sub(1).saturating_sub(*last)
+                    } else {
+                        *first
+                    }
+                })
+                .unwrap_or(0);
+            Ok(ok(json!({"offset": offset})))
+        }
+        "redirect" => {
+            let k = params.get(0).cloned().unwrap_or(Value::Null);
+            let _ = state.tx.send(
+                json!({"event": "redirect", "dict": dict.id, "params": [k]}).to_string(),
+            );
+            Ok(ok(Value::Null))
+        }
+        _ => Ok(json!({"id": id, "result": null, "error": "unknown method"})),
+    }
 }
 
 fn help() -> ! {
     println!(
         "prev {} — single-file MDict (.mdx) viewer\n\
          \n\
-         usage: prev <dictionary.mdx> [--port N] [--base PATH]\n\
+         usage: prev <path>... [--port N] [--base PATH]\n\
          \n\
+         \x20 <path>        .mdx file, or a directory searched for *.mdx\n\
          \x20 --port N      listen port on 127.0.0.1 (default 3030)\n\
          \x20 --base PATH   public mount prefix (default /mdx-preview)\n\
          \x20 -h, --help    show this help\n\
@@ -1146,9 +1420,61 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+fn is_mdx(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.eq_ignore_ascii_case("mdx"))
+        .unwrap_or(false)
+}
+
+fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    children.sort();
+    for child in children {
+        let Ok(meta) = fs::symlink_metadata(&child) else {
+            continue;
+        };
+        // Symlinked directories can loop; direct symlinked files still work.
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            walk_dir(&child, out);
+        } else if is_mdx(&child) {
+            out.push(child);
+        }
+    }
+}
+
+/// Expand files and directories into one deterministic, deduplicated list.
+fn discover(inputs: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for raw in inputs {
+        let path = PathBuf::from(raw);
+        if !path.exists() {
+            eprintln!("prev: no such file or directory: {raw}");
+            std::process::exit(1);
+        }
+        if path.is_dir() {
+            walk_dir(&path, &mut out);
+        } else if is_mdx(&path) {
+            out.push(path);
+        } else {
+            eprintln!("prev: not an .mdx file: {raw}");
+            std::process::exit(1);
+        }
+    }
+    out.sort();
+    let mut seen = HashSet::new();
+    out.retain(|p| seen.insert(fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
+    out
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let mut file: Option<String> = None;
+    let mut inputs: Vec<String> = Vec::new();
     let mut port: u16 = 3030;
     let mut base = std::env::var("PREVIEW_BASE").unwrap_or_else(|_| "/mdx-preview".into());
     let mut args = std::env::args().skip(1);
@@ -1162,55 +1488,52 @@ async fn main() -> std::io::Result<()> {
             }
             "--base" | "-b" => base = args.next().unwrap_or_else(|| usage()),
             "--help" | "-h" => help(),
-            _ => file = Some(a),
+            _ => inputs.push(a),
         }
     }
-    let file = file.unwrap_or_else(|| usage());
+    if inputs.is_empty() {
+        usage();
+    }
     let base = normalize_base(&base);
-
-    let mdx = match load_mdx(&file) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("prev: cannot read {file}: {e}");
-            std::process::exit(1);
-        }
-    };
-    if mdx.words.is_empty() {
-        eprintln!("prev: no entries in {file}");
+    let files = discover(&inputs);
+    if files.is_empty() {
+        eprintln!("prev: no .mdx files found");
         std::process::exit(1);
     }
-    let count = mdx.words.len();
-    let lower: Vec<String> = mdx.words.iter().map(|w| w.to_lowercase()).collect();
-    let initials = build_initials(&mdx.words);
+
+    let mut dicts: Vec<Dict> = Vec::new();
+    for path in files {
+        match open(&path) {
+            Ok(mdx) => {
+                let id = dicts.len();
+                dicts.push(Dict::new(id, path, mdx));
+            }
+            Err(e) => eprintln!("prev: skipping {}: {e}", path.display()),
+        }
+    }
+    if dicts.is_empty() {
+        eprintln!("prev: no readable dictionaries");
+        std::process::exit(1);
+    }
+    if dicts.iter().all(|d| d.count() == 0) {
+        eprintln!("prev: no entries in {}", inputs.join(", "));
+        std::process::exit(1);
+    }
     let _ = BASE.set(base.clone());
 
-    let dict = Arc::new(Dict {
-        mdx,
-        lower,
-        initials,
-    });
-    let (mdds, res) = load_resources(&file);
-    let (tx, _rx) = broadcast::channel(32);
-    let name = Path::new(&file)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| file.clone());
-    let state = web::Data::new(AppState {
-        dict,
-        mdds,
-        res,
-        tx,
-        name,
-    });
-
-    println!("prev: {count} headwords from {file}");
-    if !state.res.is_empty() {
+    let total: usize = dicts.iter().map(|d| d.count()).sum();
+    if dicts.len() == 1 {
         println!(
-            "prev: {} resources from {} mdd file(s)",
-            state.res.len(),
-            state.mdds.len()
+            "prev: {} headwords from {}",
+            dicts[0].count(),
+            dicts[0].path.display()
         );
+    } else {
+        println!("prev: {} dictionaries, {total} entries", dicts.len());
     }
+
+    let (tx, _rx) = broadcast::channel(32);
+    let state = web::Data::new(AppState { dicts, tx });
     println!("listening on http://127.0.0.1:{port}{base}/");
     HttpServer::new(move || {
         App::new()

@@ -187,3 +187,13 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 ## 六、阶段二（不在本计划内）
 
 合并视图需要：合并词头索引（按规范化词头排序 + 每部词典的命中位图，惰性构建）、`/api/merged/suggest`、`/api/merged/item`（返回多段 HTML 并用分隔条/词典名标注）、左栏行样式与“命中 n 部”标记。接口新增即可，不需要再改阶段一的 `/api/d/*`。
+
+## 七、实现备注（落地时与设计的差异）
+
+- **词条正文也需要索引**：`starts/ends` 来自 key 段的 `key_id`（记录偏移），所以任何读取词条的动作都会触发该词典的索引构建。惰性因此是“按词典、首次使用”而不是“词表与正文分开懒”。`lower` 并入 `KeyIndex`，`initials`/`resources` 各自 `OnceLock`。
+- **`Resources` 不含错误**：`.mdd` 失败只打印并跳过，索引构建没有可失败的路径，故 `resources` 是 `OnceLock<Resources>` 而非 `Result`。
+- **模板占位符**改为 `{res}`（值 `{base}/api/d/{dict}/res/`），避免在 `{base}` 后面拼接路径。
+- **切换器位置**：独立一行放在搜索行下方（不是搜索行内），默认 260 px 宽时搜索框不被挤压；`Ctrl+K` 开合，空过滤时高亮当前词典。
+- **根绝对路径资源**：兜底先看 `Referer`（`/api/d/{n}/...`）锁定所属词典，再按加载顺序尝试；避免为一张图把所有词典的 `.mdd` 索引都拉起来。
+- **WebSocket 关停**：广播转发任务原先在 `broadcast::recv()` 上永久挂起，持有 session 导致收到 SIGTERM 后要等 actix 的连接超时才退出；现在读取任务结束时用 oneshot 通知转发任务退出，收到 `Close` 也立即跳出。`tests/smoke.py` 把“SIGTERM 后 5 s 内退出”纳入断言。
+- **退出码**：无参数 → 2；路径不存在 / 目录里没有 `.mdx` / 全部不可读 → 1（设计里写的“没有可加载项退出 2”只保留了无参数的情况）。

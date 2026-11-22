@@ -8,6 +8,8 @@ var rpc = null;
 
 // Sidebar state: current query, loaded rows, paging base/order, selection.
 var state = {
+    dict: 0,
+    dicts: [],
     query: '',
     items: [],
     hasMore: false,
@@ -17,11 +19,18 @@ var state = {
     desc: false,
     gen: 0,
     total: 0,
-    pendingMove: 0
+    pendingMove: 0,
+    k_id: null
 };
 
+// Sidebar snapshot per dictionary id, restored when switching back.
+var dictStates = {};
+
 // Visited entries, for Alt+Left / Alt+Right.
-var nav = { ids: [], pos: -1 };  // 'history' is a read-only window property
+var nav = { items: [], pos: -1 };  // 'history' is a read-only window property
+
+// Dictionary picker: selected row index within the filtered list.
+var dictPopSel = 0;
 
 var DEFAULT_WIDTH = 260;
 var MIN_WIDTH = 180;
@@ -69,7 +78,7 @@ function ajax_ws(path, callbacks) {
             }
         } else if (resp.event) {
             var handler = callbacks[resp.event];
-            if (handler) handler(resp.params);
+            if (handler) handler(resp.params, resp);
         } else {
             log('sys_err:', resp.error);
         }
@@ -87,7 +96,7 @@ function ajax_ws(path, callbacks) {
 
         callbacks[id] = callback;
         var params = [].slice.call(arguments, 2);
-        var msg = JSON.stringify({ id: id, method: method, params: params });
+        var msg = JSON.stringify({ id: id, method: method, dict: state.dict, params: params });
         if (socket.readyState === WebSocket.OPEN) {
             socket.send(msg);
         } else if (socket.readyState === WebSocket.CONNECTING) {
@@ -107,8 +116,11 @@ function bind_ws() {
             log('disconnected.');
             setTimeout(bind_ws, 1000);
         },
-        redirect: function (params) {
+        redirect: function (params, resp) {
             log('redirect:', params[0]);
+            if (resp && resp.dict !== undefined && resp.dict !== state.dict) {
+                switch_dict(resp.dict, true);
+            }
             navigate(params[0], true);
         }
     });
@@ -256,7 +268,8 @@ function jump(label) {
 function navigate(k_id, remember) {
     if (k_id === null || k_id === undefined) return;
     if (remember !== false) record_history(k_id);
-    var url = '/api/item/' + k_id;
+    state.k_id = parseInt(k_id, 10);
+    var url = '/api/d/' + state.dict + '/item/' + k_id;
     if (els.entry.getAttribute('src') !== url) {
         els.entry.setAttribute('src', url);
     }
@@ -281,18 +294,21 @@ function pick(k_id) {
 }
 
 function record_history(k_id) {
-    var id = String(k_id);
-    if (nav.ids[nav.pos] === id) return;
-    nav.ids = nav.ids.slice(0, nav.pos + 1);
-    nav.ids.push(id);
-    nav.pos = nav.ids.length - 1;
+    var entry = { d: state.dict, k: parseInt(k_id, 10) };
+    var top = nav.items[nav.pos];
+    if (top && top.d === entry.d && top.k === entry.k) return;
+    nav.items = nav.items.slice(0, nav.pos + 1);
+    nav.items.push(entry);
+    nav.pos = nav.items.length - 1;
 }
 
 function go_history(delta) {
     var pos = nav.pos + delta;
-    if (pos < 0 || pos >= nav.ids.length) return;
+    if (pos < 0 || pos >= nav.items.length) return;
     nav.pos = pos;
-    navigate(nav.ids[pos], false);
+    var entry = nav.items[pos];
+    if (entry.d !== state.dict) switch_dict(entry.d, true);
+    navigate(entry.k, false);
 }
 
 function random_entry() {
@@ -515,6 +531,16 @@ function bind_events() {
         } else if (e.altKey && e.key === 'ArrowRight') {
             e.preventDefault();
             go_history(1);
+        } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K')) {
+            e.preventDefault();
+            if (els.dictPop.hidden) open_dict_pop();
+            else close_dict_pop();
+        } else if (e.altKey && !e.ctrlKey && e.key >= '1' && e.key <= '9') {
+            var want = parseInt(e.key, 10) - 1;
+            if (state.dicts[want]) {
+                e.preventDefault();
+                switch_dict(state.dicts[want].id);
+            }
         }
     });
 
@@ -550,12 +576,201 @@ function bind_events() {
     });
 }
 
+// ------------------------------------------------------------- dictionaries
+
+function current_dict() {
+    for (var i = 0; i < state.dicts.length; i++) {
+        if (state.dicts[i].id === state.dict) return state.dicts[i];
+    }
+    return null;
+}
+
+function saved_dict_id() {
+    var name = null;
+    try { name = localStorage.getItem('preview.dict'); } catch (e) { }
+    if (name) {
+        for (var i = 0; i < state.dicts.length; i++) {
+            if (state.dicts[i].name === name) return state.dicts[i].id;
+        }
+    }
+    return state.dicts.length ? state.dicts[0].id : 0;
+}
+
+function update_status() {
+    var d = current_dict();
+    if (!d) return;
+    state.total = d.count;
+    var text = d.count + ' 词条 · ' + d.name;
+    if (state.dicts.length > 1) {
+        text += ' (' + (state.dict + 1) + '/' + state.dicts.length + ')';
+    }
+    els.status.textContent = text;
+}
+
+function render_dict_button() {
+    var d = current_dict();
+    els.dictBtn.textContent = (d ? d.name : '…') + ' \u25be';
+    els.dictBtn.title = d && d.path ? d.path : '切换词典 (Ctrl+K)';
+    els.dictBtn.disabled = state.dicts.length < 2;
+}
+
+function switch_dict(id, keepEntry) {
+    if (!state.dicts.length || id === state.dict) return;
+    if (!current_dict()) return;
+    var known = false;
+    for (var i = 0; i < state.dicts.length; i++) {
+        if (state.dicts[i].id === id) known = true;
+    }
+    if (!known) return;
+    dictStates[state.dict] = {
+        query: state.query,
+        base: state.base,
+        selected: state.selected,
+        k_id: state.k_id,
+        scroll: els.list.scrollTop
+    };
+    state.dict = id;
+    try { localStorage.setItem('preview.dict', current_dict().name); } catch (e) { }
+    render_dict_button();
+    update_status();
+    load_initials();
+    var s = dictStates[id] || { query: '', base: 0, selected: -1, k_id: null, scroll: 0 };
+    state.query = s.query;
+    els.query.value = s.query;
+    clear_list();
+    state.base = s.base;
+    els.status.textContent = '正在读取索引…';
+    load_at(s.base, function (ok) {
+        update_status();
+        if (!ok) return;
+        if (s.selected >= 0) set_active(s.selected);
+        if (s.scroll) els.list.scrollTop = s.scroll;
+    });
+    if (!keepEntry) {
+        if (s.k_id) {
+            navigate(s.k_id, false);
+        } else {
+            els.entry.setAttribute('src', 'about:blank');
+            state.k_id = null;
+        }
+    }
+}
+
+function open_dict_pop() {
+    if (state.dicts.length < 2) return;
+    dictPopSel = 0;
+    els.dictFilter.value = '';
+    render_dict_rows('');
+    var rows = els.dictList.children;
+    for (var i = 0; i < rows.length; i++) {
+        if (parseInt(rows[i].dataset.id, 10) === state.dict) dictPopSel = i;
+    }
+    paint_dict_sel();
+    els.dictPop.hidden = false;
+    els.dictPop.style.top = (els.dictRow.offsetTop + els.dictRow.offsetHeight) + 'px';
+    els.dictFilter.focus();
+}
+
+function close_dict_pop() {
+    els.dictPop.hidden = true;
+}
+
+function render_dict_rows(filter) {
+    var f = (filter || '').toLowerCase();
+    els.dictList.textContent = '';
+    var shown = 0;
+    state.dicts.forEach(function (d) {
+        if (f && d.name.toLowerCase().indexOf(f) < 0 &&
+            (d.path || '').toLowerCase().indexOf(f) < 0) {
+            return;
+        }
+        var row = document.createElement('div');
+        row.className = d.id === state.dict ? 'dict-row active' : 'dict-row';
+        row.dataset.id = d.id;
+        var name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = d.name;
+        var count = document.createElement('span');
+        count.className = 'count';
+        count.textContent = d.count;
+        row.appendChild(name);
+        row.appendChild(count);
+        row.addEventListener('click', function () {
+            close_dict_pop();
+            switch_dict(d.id);
+            els.query.focus();
+        });
+        els.dictList.appendChild(row);
+        shown++;
+    });
+    if (dictPopSel > shown - 1) dictPopSel = Math.max(0, shown - 1);
+    if (dictPopSel < 0) dictPopSel = 0;
+    paint_dict_sel();
+}
+
+function paint_dict_sel() {
+    var rows = els.dictList.children;
+    for (var i = 0; i < rows.length; i++) {
+        rows[i].classList.toggle('sel', i === dictPopSel);
+    }
+    if (rows[dictPopSel]) rows[dictPopSel].scrollIntoView({ block: 'nearest' });
+}
+
+function dict_pop_move(delta) {
+    var n = els.dictList.children.length;
+    if (!n) return;
+    dictPopSel = Math.min(n - 1, Math.max(0, dictPopSel + delta));
+    paint_dict_sel();
+}
+
+function dict_pop_choose() {
+    var row = els.dictList.children[dictPopSel];
+    if (!row) return;
+    close_dict_pop();
+    switch_dict(parseInt(row.dataset.id, 10));
+    els.query.focus();
+}
+
+function bind_dict_picker() {
+    els.dictBtn.addEventListener('click', function () {
+        if (els.dictPop.hidden) open_dict_pop();
+        else close_dict_pop();
+    });
+    els.dictFilter.addEventListener('input', function () {
+        dictPopSel = 0;
+        render_dict_rows(els.dictFilter.value.trim());
+    });
+    els.dictFilter.addEventListener('keydown', function (e) {
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            dict_pop_move(1);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            dict_pop_move(-1);
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            dict_pop_choose();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            close_dict_pop();
+            els.query.focus();
+        }
+    });
+}
+
 function load_status() {
     fetch('/api/parser')
         .then(function (r) { return r.json(); })
         .then(function (data) {
-            state.total = data.count;
-            els.status.textContent = data.count + ' 词条 · ' + data.name;
+            state.dicts = data.dicts || [];
+            if (!state.dicts.length) return;
+            var saved = saved_dict_id();
+            if (saved !== state.dict) {
+                switch_dict(saved);
+            } else {
+                update_status();
+                render_dict_button();
+            }
         })
         .catch(function () { });
 }
@@ -568,6 +783,11 @@ window.addEventListener('DOMContentLoaded', function () {
     els.entry = document.getElementById('entry');
     els.splitter = document.getElementById('splitter');
     els.sortBtn = document.getElementById('sort-btn');
+    els.dictRow = document.getElementById('dict-row');
+    els.dictBtn = document.getElementById('dict-btn');
+    els.dictPop = document.getElementById('dict-pop');
+    els.dictFilter = document.getElementById('dict-filter');
+    els.dictList = document.getElementById('dict-list');
 
     var savedWidth = parseInt(localStorage.getItem('preview.sidebarWidth'), 10);
     set_width(savedWidth > 0 ? savedWidth : DEFAULT_WIDTH, false);
@@ -578,6 +798,7 @@ window.addEventListener('DOMContentLoaded', function () {
 
     bind_events();
     bind_splitter();
+    bind_dict_picker();
     bind_ws();
     load_status();
     // GoldenDict-style: the whole headword list is browsable before typing.

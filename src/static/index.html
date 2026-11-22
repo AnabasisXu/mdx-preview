@@ -16,6 +16,13 @@
             <input type="text" id="query" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus />
             <button type="button" id="sort-btn" title="切换词头顺序">↑</button>
         </div>
+        <div id="dict-row">
+            <button type="button" id="dict-btn" title="切换词典 (Ctrl+K)">…</button>
+        </div>
+        <div id="dict-pop" hidden>
+            <input type="text" id="dict-filter" autocomplete="off" spellcheck="false" />
+            <div id="dict-list" role="listbox"></div>
+        </div>
         <div id="initials"></div>
         <div id="word-list" role="listbox"></div>
         <div id="status"></div>

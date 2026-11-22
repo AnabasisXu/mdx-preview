@@ -600,6 +600,17 @@ function bind_events() {
                 }
             }
         }
+        // Some browsers/extensions refuse programmatic focus; typing while
+        // no text field has the caret must still search, like a dictionary.
+        if (els.dictPop.hidden && e.key.length === 1 && e.key !== ' ' &&
+            !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing &&
+            !is_text_field(document.activeElement)) {
+            e.preventDefault();
+            els.query.value += e.key;
+            els.query.dispatchEvent(new Event('input', { bubbles: true }));
+            els.query.focus();
+            return;
+        }
         if (e.key === 'F5') {
             e.preventDefault();
             random_entry();
@@ -662,6 +673,11 @@ function bind_events() {
 }
 
 // ------------------------------------------------------------- dictionaries
+
+function is_text_field(el) {
+    if (!el || !el.tagName) return false;
+    return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable === true;
+}
 
 function current_dict() {
     for (var i = 0; i < state.dicts.length; i++) {

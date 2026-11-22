@@ -1577,7 +1577,7 @@ fn rpc_reply(
 
 fn help() -> ! {
     println!(
-        "prev {} — single-file MDict (.mdx) viewer\n\
+        "prev — single-file MDict (.mdx) viewer\n\
          \n\
          usage: prev <path>... [--port N] [--base PATH]\n\
          \n\
@@ -1587,14 +1587,13 @@ fn help() -> ! {
          \x20 -h, --help    show this help\n\
          \x20 -V, --version print the version\n\
          \n\
-         env: PREVIEW_BASE overrides --base",
-        env!("CARGO_PKG_VERSION")
+         env: PREVIEW_BASE overrides --base"
     );
     std::process::exit(0);
 }
 
 fn version() -> ! {
-    println!("prev {}", env!("CARGO_PKG_VERSION"));
+    println!("prev {} (built {})", env!("CARGO_PKG_VERSION"), env!("PREV_BUILD_TIME"));
     std::process::exit(0);
 }
 

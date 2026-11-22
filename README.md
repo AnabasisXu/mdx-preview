@@ -77,6 +77,7 @@ prev <path>... [--port N] [--base PATH]
 
 ### 与 Surfingkeys 的配合
 
+- Surfingkeys 默认开启 `stealFocusOnLoad`，会撤销页面发起的聚焦：表现为打开页面或切换词典后光标不在搜索框，必须先点一下输入框才能打字。在 Surfingkeys 设置里关闭该项（或对本页禁用扩展）即可恢复。
 - 普通点击词条正文后，键盘焦点交回左栏：顶层文档的快捷键（本页的 F5、Alt+←/→、Ctrl+L，以及 Surfingkeys 的映射）继续可用。
 - 拖选文本时焦点留在词条内，Ctrl+C 复制的仍是词条内容。
 - 若焦点确实在词条 iframe 里（例如用 Surfingkeys 的 `w` 选择 frame），按键由该 frame 内的 Surfingkeys 实例处理：`f` 只提示这个 frame 里的链接（prev 的词条通常没有链接，所以看起来没反应），其余映射也只作用于该 frame。用 `w` 回到顶层即可恢复。

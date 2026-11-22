@@ -4,7 +4,7 @@
 
 **范围外：** 合并词头列表与多词典堆叠词条（阶段二）；GoldenDict 分组配置；自定义预览模板（`--template`/`--css`）；HTTP/2。
 
-**构建环境：** 源码与 git 仓库在 tx（`/root/cleantest/mdx-preview`），tx 已无 Rust 工具链；编译在 gb（`/data/home/mdx-preview`，cargo 1.99）。改动流程：编辑 tx 源码 → `tar` 同步到 gb → gb 上 `cargo build --release` 与 `cargo zigbuild --release --target x86_64-pc-windows-gnu` → 冒烟在 gb（浏览器）+ 本机 Windows（exe）。
+**构建环境：** 源码与 git 仓库在 tx（`/root/GitHub/prev`），tx 已无 Rust 工具链；编译在 gb（`/data/home/mdx-preview`，cargo 1.99）。改动流程：编辑 tx 源码 → `tar` 同步到 gb → gb 上 `cargo build --release` 与 `cargo zigbuild --release --target x86_64-pc-windows-gnu` → 冒烟在 gb（浏览器）+ 本机 Windows（exe）。
 
 ## 一、现状约束（来自代码，非推测）
 

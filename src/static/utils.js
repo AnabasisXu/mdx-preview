@@ -591,6 +591,9 @@ function bind_events() {
             e.preventDefault();
             els.query.focus();
             els.query.select();
+        } else if (e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === 'r' || e.key === 'R')) {
+            e.preventDefault();
+            set_order(!state.desc);
         } else if (e.altKey && e.key === 'ArrowLeft') {
             e.preventDefault();
             go_history(-1);

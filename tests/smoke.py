@@ -142,6 +142,14 @@ def main():
         get(f"{base}/api/d/0/res/missing.png", expect=404)
         get(f"http://127.0.0.1:{port}/favicon.ico", expect=204)
 
+        # The shell must not be cached, or an upgraded binary keeps serving the
+        # previous protocol's URLs to an already-open tab.
+        shell = base + "/"
+        for url in (shell, base + "/dist/utils.js", base + "/dist/site.css"):
+            with urllib.request.urlopen(url) as r:
+                cache = r.headers.get("Cache-Control", "")
+                assert "no-store" in cache, (url, cache)
+
         s = ws_open(port)
         try:
             ws_send(s, {"id": 1, "method": "suggest_words", "dict": 0, "params": ["", 0, False]})

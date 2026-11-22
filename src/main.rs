@@ -1051,6 +1051,7 @@ struct AppState {
 async fn index_page() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
+        .insert_header(("Cache-Control", "no-store"))
         .body(rebase(INDEX_HTML))
 }
 
@@ -1123,6 +1124,7 @@ async fn item(path: web::Path<(usize, u32)>, state: web::Data<AppState>) -> impl
             let title = dict.word(k_id).ok().flatten().unwrap_or("");
             HttpResponse::Ok()
                 .content_type("text/html; charset=utf-8")
+                .insert_header(("Cache-Control", "no-store"))
                 .body(render_item(dict, title, &text))
         }
         Ok(None) => HttpResponse::NotFound().body("404"),
@@ -1233,9 +1235,11 @@ async fn dist(path: web::Path<String>) -> impl Responder {
     match path.into_inner().as_str() {
         "site.css" => HttpResponse::Ok()
             .content_type("text/css; charset=utf-8")
+            .insert_header(("Cache-Control", "no-store"))
             .body(SITE_CSS),
         "utils.js" => HttpResponse::Ok()
             .content_type("application/javascript; charset=utf-8")
+            .insert_header(("Cache-Control", "no-store"))
             .body(rebase(UTILS_JS)),
         _ => HttpResponse::NotFound().body("FILE_NOT_FOUND"),
     }

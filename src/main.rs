@@ -1071,10 +1071,76 @@ fn root(cfg: &mut web::ServiceConfig) {
 }
 
 fn render_item(dict: &Dict, title: &str, body_html: &str) -> String {
+    let res_base = format!("{}/api/d/{}/res/", base(), dict.id);
+    let item_base = format!("{}/api/d/{}/item/", base(), dict.id);
+    let body = rewrite_links(dict, &item_base, &res_base, body_html);
     ITEM_HTML
-        .replace("{res}", &format!("{}/api/d/{}/res/", base(), dict.id))
+        .replace("{res}", &res_base)
         .replace("{title}", title)
-        .replace("{attributes}", body_html)
+        .replace("{attributes}", &body)
+}
+
+/// Rewrite MDict pseudo-schemes in entry HTML: `entry://word` becomes a link to
+/// the target entry (when the headword exists), `sound://file` a resource link.
+fn rewrite_links(dict: &Dict, item_base: &str, res_base: &str, body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut copied = 0usize;
+    let mut search = 0usize;
+    while let Some(pos) = next_pseudo_link(body, search) {
+        let entry = body[pos..].starts_with("entry://");
+        let Some(quote_pos) = body[..pos].rfind(['"', '\'']) else {
+            break;
+        };
+        let quote = body.as_bytes()[quote_pos] as char;
+        if !body[..quote_pos].trim_end().ends_with('=') {
+            search = pos + 1;
+            continue;
+        }
+        let Some(end_rel) = body[pos..].find(quote) else {
+            break;
+        };
+        let end = pos + end_rel;
+        let value = &body[pos..end];
+        let target = if entry {
+            let word = value.trim_start_matches("entry://");
+            let word = word.split('#').next().unwrap_or(word);
+            let word = percent_encoding::percent_decode_str(word).decode_utf8_lossy();
+            entry_id(dict, word.trim()).map(|id| format!("{item_base}{id}"))
+        } else {
+            Some(format!(
+                "{res_base}{}",
+                value.trim_start_matches("sound://")
+            ))
+        };
+        if let Some(url) = target {
+            out.push_str(&body[copied..quote_pos + 1]);
+            out.push_str(&url);
+            copied = end;
+        }
+        search = end + 1;
+    }
+    out.push_str(&body[copied..]);
+    out
+}
+
+fn next_pseudo_link(body: &str, from: usize) -> Option<usize> {
+    let hay = &body[from..];
+    let a = hay.find("entry://").map(|i| from + i);
+    let b = hay.find("sound://").map(|i| from + i);
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+fn entry_id(dict: &Dict, word: &str) -> Option<u32> {
+    if word.is_empty() {
+        return None;
+    }
+    let index = dict.index().ok()?;
+    index.find(word).map(|idx| idx as u32 + 1)
 }
 
 fn unknown_dict() -> HttpResponse {
@@ -1149,6 +1215,11 @@ fn serve_resource(dict: &Dict, rel: &str) -> HttpResponse {
     if rel.is_empty() || rel.contains("..") {
         return HttpResponse::NotFound().body("NOT_FOUND");
     }
+    // A real file next to the dictionary shadows the .mdd copy, so stylesheets
+    // can be edited in place; it is never cached because it changes on save.
+    if let Some(resp) = serve_disk_resource(dict, rel) {
+        return resp;
+    }
     let key = norm_res(rel);
     let resources = dict.resources();
     let Some(res) = resources.map.get(&key) else {
@@ -1161,6 +1232,27 @@ fn serve_resource(dict: &Dict, rel: &str) -> HttpResponse {
             .body(bytes),
         Err(e) => HttpResponse::InternalServerError().body(format!("READ_ERROR: {e}")),
     }
+}
+
+/// Only CSS/JS are taken from disk; anything else keeps coming from the .mdd.
+fn serve_disk_resource(dict: &Dict, rel: &str) -> Option<HttpResponse> {
+    let ext = Path::new(rel).extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "css" && ext != "js" {
+        return None;
+    }
+    let dir = dict.path.parent()?;
+    let root = fs::canonicalize(dir).ok()?;
+    let file = fs::canonicalize(dir.join(rel)).ok()?;
+    if !file.starts_with(&root) {
+        return None;
+    }
+    let bytes = fs::read(&file).ok()?;
+    Some(
+        HttpResponse::Ok()
+            .content_type(mime_of(rel))
+            .insert_header(("Cache-Control", "no-store"))
+            .body(bytes),
+    )
 }
 
 #[get("/api/d/{dict}/res/{path:.*}")]
@@ -1462,6 +1554,54 @@ fn discover(inputs: &[String]) -> Vec<PathBuf> {
     out
 }
 
+/// Watch each dictionary directory for CSS/JS saves and fan a reload event out
+/// to every client viewing that dictionary. Non-recursive: resources live next
+/// to the .mdx.
+fn spawn_watcher(dirs: Vec<(PathBuf, Vec<usize>)>, tx: broadcast::Sender<String>) {
+    std::thread::spawn(move || {
+        use notify::{RecursiveMode, Watcher};
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = raw_tx.send(res);
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("prev: file watch disabled: {e}");
+                return;
+            }
+        };
+        let mut seen = HashSet::new();
+        for (dir, _) in &dirs {
+            if seen.insert(dir.clone()) {
+                if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                    eprintln!("prev: cannot watch {}: {e}", dir.display());
+                }
+            }
+        }
+        for res in raw_rx {
+            let Ok(event) = res else {
+                continue;
+            };
+            let edited = event.paths.iter().any(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("css") || e.eq_ignore_ascii_case("js"))
+                    .unwrap_or(false)
+            });
+            if !edited {
+                continue;
+            }
+            for (dir, ids) in &dirs {
+                if event.paths.iter().any(|p| p.parent() == Some(dir.as_path())) {
+                    for id in ids {
+                        let _ = tx.send(json!({"event": "reload", "dict": id}).to_string());
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let mut inputs: Vec<String> = Vec::new();
@@ -1523,6 +1663,23 @@ async fn main() -> std::io::Result<()> {
     }
 
     let (tx, _rx) = broadcast::channel(32);
+    let mut watch: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+    for dict in &dicts {
+        let dir = dict
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Event paths arrive absolute (and canonicalized on Windows), so watch
+        // and compare the canonical directory.
+        let dir = fs::canonicalize(&dir).unwrap_or(dir);
+        match watch.iter_mut().find(|(p, _)| *p == dir) {
+            Some((_, ids)) => ids.push(dict.id),
+            None => watch.push((dir, vec![dict.id])),
+        }
+    }
+    spawn_watcher(watch, tx.clone());
     let state = web::Data::new(AppState { dicts, tx });
     let listening = format!("listening on http://127.0.0.1:{port}{base}/");
     let server = HttpServer::new(move || {

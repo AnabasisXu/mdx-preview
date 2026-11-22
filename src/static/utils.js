@@ -125,8 +125,20 @@ function bind_ws() {
                 switch_dict(resp.dict, true);
             }
             navigate(params[0], true);
+        },
+        reload: function (params, resp) {
+            if (!resp || resp.dict === undefined || resp.dict !== state.dict) return;
+            reload_entry();
         }
     });
+}
+
+// A CSS/JS file next to the dictionary was saved. Reload the entry with a
+// cache-busting suffix so the stylesheet link picks up the new bytes.
+function reload_entry() {
+    if (!state.k_id) return;
+    var url = '/api/d/' + state.dict + '/item/' + state.k_id + '?t=' + Date.now();
+    els.entry.setAttribute('src', url);
 }
 
 // ------------------------------------------------------------------ results

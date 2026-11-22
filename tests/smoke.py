@@ -102,6 +102,9 @@ def main():
         os.makedirs(os.path.join(work, "two"))
         shutil.copy(sample, os.path.join(work, "one", "alpha.mdx"))
         shutil.copy(sample, os.path.join(work, "two", "beta.mdx"))
+        css = b"body{color:red}\n"
+        with open(os.path.join(work, "one", "alpha.css"), "wb") as f:
+            f.write(css)
         with open(sample, "rb") as f:
             head = f.read(200)
         with open(os.path.join(work, "broken.mdx"), "wb") as f:
@@ -146,6 +149,9 @@ def main():
         get(f"{base}/api/d/9/item/1", expect=404)
         get(f"{base}/api/d/9/lookup/ab", expect=404)
         get(f"{base}/api/d/0/res/missing.png", expect=404)
+        # A real .css next to the dictionary shadows the .mdd copy.
+        assert get(f"{base}/api/d/0/res/alpha.css") == css
+        get(f"{base}/api/d/1/res/alpha.css", expect=404)
         get(f"http://127.0.0.1:{port}/favicon.ico", expect=204)
 
         # The shell must not be cached, or an upgraded binary keeps serving the

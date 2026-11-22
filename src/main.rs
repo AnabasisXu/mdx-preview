@@ -407,12 +407,15 @@ impl Mdx {
         })
     }
 
-    fn text_at(&self, idx: usize, index: &KeyIndex) -> Option<String> {
-        let start = *index.starts.get(idx)? as usize;
-        let end = *index.ends.get(idx)? as usize;
-        let raw = self.raw(start, end).ok()?;
+    fn text_at(&self, idx: usize, index: &KeyIndex) -> Result<Option<String>, String> {
+        let (Some(start), Some(end)) = (index.starts.get(idx), index.ends.get(idx)) else {
+            return Ok(None);
+        };
+        let raw = self
+            .raw(*start as usize, *end as usize)
+            .map_err(|e| format!("entry {idx}: {e}"))?;
         let text = decode(&raw, self.codec);
-        Some(text.trim_end_matches('\0').to_string())
+        Ok(Some(text.trim_end_matches('\0').to_string()))
     }
 
     /// Entry text with `@@@LINK=` redirects followed (bounded, cycle-safe).
@@ -423,7 +426,7 @@ impl Mdx {
         let index = self.index()?;
         let mut cur = idx;
         for _ in 0..16 {
-            let Some(text) = self.text_at(cur, index) else {
+            let Some(text) = self.text_at(cur, index)? else {
                 return Ok(None);
             };
             let Some(target) = text.trim().strip_prefix("@@@LINK=") else {
@@ -435,7 +438,7 @@ impl Mdx {
                 _ => return Ok(Some(text)),
             }
         }
-        Ok(self.text_at(idx, index))
+        self.text_at(idx, index)
     }
 
     fn word(&self, id: u32) -> Result<Option<&str>, String> {
@@ -521,7 +524,11 @@ fn open(path: &Path) -> io::Result<Mdx> {
     // --- record section
     need(&d, p, 4 * width)?;
     let num_record_blocks = read_num(&d, &mut p, width)?;
-    let table = num_record_blocks
+    let _num_entries2 = read_num(&d, &mut p, width)?;
+    let _rb_info_size = read_num(&d, &mut p, width)?;
+    let _rb_size = read_num(&d, &mut p, width)?;
+    // The block directory sits between here and the first record block.
+    let data_start = num_record_blocks
         .checked_mul(2 * width as u64)
         .and_then(|n| usize::try_from(n).ok())
         .and_then(|n| p.checked_add(n))
@@ -532,9 +539,6 @@ fn open(path: &Path) -> io::Result<Mdx> {
                 "record block table lies outside the file",
             )
         })?;
-    let _num_entries2 = read_num(&d, &mut p, width)?;
-    let _rb_info_size = read_num(&d, &mut p, width)?;
-    let _rb_size = read_num(&d, &mut p, width)?;
     let mut info: Vec<(usize, usize)> = Vec::new();
     for _ in 0..num_record_blocks {
         let comp = read_num(&d, &mut p, width)? as usize;
@@ -543,7 +547,7 @@ fn open(path: &Path) -> io::Result<Mdx> {
     }
 
     let mut blocks = Vec::with_capacity(info.len());
-    let mut offset = table;
+    let mut offset = data_start;
     for (comp, decomp) in info {
         blocks.push(RecordBlock {
             offset,

@@ -137,6 +137,12 @@ def main():
             hits = json.loads(get(f"{base}/api/d/{i}/lookup/ab"))
             assert hits["items"], hits
 
+        # Entry text must come from the right record block, not from garbage.
+        word, kid = json.loads(get(f"{base}/api/d/0/lookup/a"))["items"][0]
+        html = get(f"{base}/api/d/0/item/{kid}").decode()
+        assert f'<h1 id="headword">{word}</h1>' in html, html[:300]
+        assert "\ufffd" not in html, "entry text is not valid UTF-8"
+
         get(f"{base}/api/d/9/item/1", expect=404)
         get(f"{base}/api/d/9/lookup/ab", expect=404)
         get(f"{base}/api/d/0/res/missing.png", expect=404)

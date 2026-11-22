@@ -154,6 +154,7 @@ body {
 
 #dict-filter:focus {
     border-color: #7aa7d4;
+    box-shadow: 0 0 0 2px rgba(39, 106, 173, 0.18);
 }
 
 #dict-list {

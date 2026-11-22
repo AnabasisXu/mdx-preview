@@ -568,11 +568,27 @@ function bind_events() {
     });
 
     document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !els.dictPop.hidden) {
-            e.preventDefault();
-            close_dict_pop();
-            els.query.focus();
-            return;
+        if (!els.dictPop.hidden) {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                close_dict_pop();
+                els.query.focus();
+                return;
+            }
+            // The filter handles its own keys; this keeps arrows/Enter working
+            // when focus sits on the list (browse mode) or anywhere else.
+            if (document.activeElement !== els.dictFilter) {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    dict_pop_move(e.key === 'ArrowDown' ? 1 : -1);
+                    return;
+                }
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    dict_pop_choose();
+                    return;
+                }
+            }
         }
         if (e.key === 'F5') {
             e.preventDefault();
@@ -737,8 +753,16 @@ function open_dict_pop(mode) {
     paint_dict_sel();
     els.dictPop.hidden = false;
     els.dictPop.style.top = (els.dictRow.offsetTop + els.dictRow.offsetHeight) + 'px';
-    if (mode === 'search') els.dictFilter.focus();
-    else els.dictList.focus();
+    if (mode === 'search') {
+        els.dictFilter.focus();
+        // Some browsers finish their own default action after this handler and
+        // steal focus back; take it again on the next task.
+        setTimeout(function () {
+            try { els.dictFilter.focus(); } catch (e) { }
+        }, 0);
+    } else {
+        els.dictList.focus();
+    }
 }
 
 function close_dict_pop() {

@@ -8,7 +8,7 @@ name = "prev"
 path = "src/main.rs"
 
 [dependencies]
-actix-web = "4"
+actix-web = { version = "4", default-features = false, features = ["macros"] }
 actix-ws = "0.3"
 futures-util = "0.3"
 serde_json = "1"
@@ -18,3 +18,10 @@ ripemd = "0.1"
 encoding_rs = "0.8"
 percent-encoding = "2"
 memmap2 = "0.9"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

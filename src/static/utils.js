@@ -555,7 +555,7 @@ function load_status() {
         .then(function (r) { return r.json(); })
         .then(function (data) {
             state.total = data.count;
-            els.status.textContent = data.count + ' 词条 · ' + data.encoding;
+            els.status.textContent = data.count + ' 词条 · ' + data.name;
         })
         .catch(function () { });
 }

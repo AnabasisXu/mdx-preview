@@ -862,6 +862,8 @@ struct AppState {
     mdds: Vec<Mdd>,
     res: HashMap<String, Resource>,
     tx: broadcast::Sender<String>,
+    /// Dictionary file name without extension, shown in the status bar.
+    name: String,
 }
 
 #[get("/")]
@@ -907,7 +909,7 @@ fn render_item(title: &str, body_html: &str) -> String {
 #[get("/api/parser")]
 async fn parser(state: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(json!({
-        "encoding": state.dict.mdx.encoding,
+        "name": state.name,
         "count": state.dict.mdx.words.len(),
     }))
 }
@@ -1125,14 +1127,24 @@ async fn ws(
     Ok(response)
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "prev — single-file MDict (.mdx) viewer\n\n\
-         usage: prev <dictionary.mdx> [--port N] [--base PATH]\n\n\
-           --port N      listen port on 127.0.0.1 (default 3030)\n\
-           --base PATH   public mount prefix (default /mdx-preview)\n\n\
-         env: PREVIEW_BASE overrides --base"
+fn help() -> ! {
+    println!(
+        "prev {} — single-file MDict (.mdx) viewer\n\
+         \n\
+         usage: prev <dictionary.mdx> [--port N] [--base PATH]\n\
+         \n\
+         \x20 --port N      listen port on 127.0.0.1 (default 3030)\n\
+         \x20 --base PATH   public mount prefix (default /mdx-preview)\n\
+         \x20 -h, --help    show this help\n\
+         \n\
+         env: PREVIEW_BASE overrides --base",
+        env!("CARGO_PKG_VERSION")
     );
+    std::process::exit(0);
+}
+
+fn usage() -> ! {
+    eprintln!("prev: invalid arguments; try --help");
     std::process::exit(2);
 }
 
@@ -1151,7 +1163,7 @@ async fn main() -> std::io::Result<()> {
                     .unwrap_or_else(|| usage())
             }
             "--base" | "-b" => base = args.next().unwrap_or_else(|| usage()),
-            "--help" | "-h" => usage(),
+            "--help" | "-h" => help(),
             _ => file = Some(a),
         }
     }
@@ -1181,11 +1193,16 @@ async fn main() -> std::io::Result<()> {
     });
     let (mdds, res) = load_resources(&file);
     let (tx, _rx) = broadcast::channel(32);
+    let name = Path::new(&file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.clone());
     let state = web::Data::new(AppState {
         dict,
         mdds,
         res,
         tx,
+        name,
     });
 
     println!("prev: {count} headwords from {file}");

@@ -25,6 +25,7 @@ prev <dictionary.mdx> [--port N] [--base PATH]
 
   --port N      监听端口，默认 3030（只绑定 127.0.0.1）
   --base PATH   公开挂载前缀，默认 /mdx-preview
+  -h, --help    输出版本与用法后退出
 ```
 
 - `--base ""` 表示挂在站点根路径（`http://127.0.0.1:3030/`）
@@ -50,7 +51,7 @@ prev <dictionary.mdx> [--port N] [--base PATH]
 | 左栏分隔条 | 拖动调整宽度（存 localStorage），双击复位 260 px |
 | Ctrl + 滚轮 | 浏览器自带缩放，不再单独实现 |
 
-状态栏显示词条总数与容器编码。
+状态栏显示词条总数与词典名称（文件名去掉扩展名）。
 
 ## 实现要点
 

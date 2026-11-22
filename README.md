@@ -33,7 +33,7 @@ prev a.mdx b.mdx --port 8080 --base ""
 ```
 prev <path>... [--port N] [--base PATH]
 
-  <path>        .mdx 文件，或目录（递归查找 *.mdx）
+  <path>        .mdx 文件，或目录（递归查找 *.mdx，含子目录）
   --port N      监听端口，默认 3030（只绑定 127.0.0.1）
   --base PATH   公开挂载前缀，默认 /mdx-preview
   -h, --help    输出版本与用法后退出
@@ -67,7 +67,12 @@ prev <path>... [--port N] [--base PATH]
 
 状态栏显示当前词典的词条总数与名称；多部词典时附带 `(当前/总数)`。每部词典的搜索词、翻页位置和选中行在切换时各自保留，刷新后按词典名恢复上次使用的词典。
 
-点击词条正文后键盘焦点会回到左栏：浏览器会把键盘事件交给获得焦点的 iframe，Surfingkeys 等扩展和本页快捷键都会因此失效；拖选文本时焦点留在词条内，Ctrl+C 复制正常。
+### 与 Surfingkeys 的配合
+
+- 普通点击词条正文后，键盘焦点交回左栏：顶层文档的快捷键（本页的 F5、Alt+←/→、Ctrl+L，以及 Surfingkeys 的映射）继续可用。
+- 拖选文本时焦点留在词条内，Ctrl+C 复制的仍是词条内容。
+- 若焦点确实在词条 iframe 里（例如用 Surfingkeys 的 `w` 选择 frame），按键由该 frame 内的 Surfingkeys 实例处理：`f` 只提示这个 frame 里的链接（prev 的词条通常没有链接，所以看起来没反应），其余映射也只作用于该 frame。用 `w` 回到顶层即可恢复。
+- Surfingkeys 在每个 iframe 中第一次按键会先完成一次初始化（这次按键被吞掉），因此 frame 内偶尔第一次按键无响应。
 
 ## 实现要点
 
@@ -80,7 +85,7 @@ prev <path>... [--port N] [--base PATH]
 - **资源**：`.mdd` 按需读取压缩块；词条页用 `<base href="{base}/api/d/{dict}/res/">` 把相对路径固定到所属词典。根绝对路径（`/img.png`）不带词典信息，兜底路由先看请求的 `Referer`（`/api/d/{n}/...`）再按加载顺序找第一个命中
 - **挂载**：所有路由通过 `web::scope(--base)` 挂载，页面内生成的链接与路由前缀一致；裸 `/` 302 到前缀
 
-## 性能（gb 实测：Debian 13，4 vCPU，8 GB）
+## 性能（Linux 实测：Debian 13，4 vCPU，8 GB）
 
 | 词典 | 词条 | 启动 | 常驻内存 (RSS) | 取词条 p50 | 搜索 p50 |
 |---|---|---|---|---|---|
@@ -91,7 +96,7 @@ prev <path>... [--port N] [--base PATH]
 
 > 上表是“打开即建索引”版本的测量值。现在索引推迟到该词典首次使用（打开词条列表或搜索）时构建，进程启动本身是毫秒级；单词典的首屏时间与上表启动列大致相当，多词典则只付被浏览那一部的代价。
 
-## 内存实测（gb，2000 次取词 + 120 次搜索）
+## 内存实测（Linux，2000 次取词 + 120 次搜索）
 
 | 词典 | 起始 RSS / 匿名 | 压测后 RSS / 匿名 | 空闲 3 s 后 |
 |---|---|---|---|
@@ -139,12 +144,17 @@ python3 tests/smoke.py target/release/prev /path/to/sample.mdx
 
 脚本用同一份词典的两个副本加一个截断文件启动 prev，检查词典列表、每部词条的 `<base>`、lookup、未知词典 404、WebSocket 的 `dict` 路由与 `redirect` 广播、以及损坏文件被跳过。
 
+## 更新记录
+
+- **0.2.0**：一次加载多部词典（`.mdx` 文件或目录，递归含子目录）；接口按词典命名空间化并加入词典切换器；词表索引按词典惰性构建，目录模式启动为毫秒级；跳转条改为等距覆盖并随左栏宽度自适应；点击词条后焦点回到外壳，Surfingkeys 继续可用；损坏的 `.mdx` / `.mdd` 报错并跳过而不是崩溃。
+- **0.1.0**：首个版本，单文件 MDX/MDD 预览器。
+
 ## 目录
 
 ```
 src/main.rs             解析器 + HTTP/WebSocket 服务
 src/static/index.html   外壳：左栏词表 + 词典选择浮层 + 右侧词条 iframe
-src/static/utils.js     前端逻辑：分页、排序、首字跳转、词典切换、快捷键
+src/static/utils.js     前端逻辑：分页、排序、跳转条、词典切换、快捷键
 src/static/site.css     外壳样式
 src/static/item.html    词条模板（通用排版 + 资源 base）
 tests/smoke.py          HTTP/WS 冒烟测试

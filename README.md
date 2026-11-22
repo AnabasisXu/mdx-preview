@@ -2,6 +2,8 @@
 
 单文件 MDict（`.mdx` / `.mdd`）浏览器，inspired by [Preview - 修改MDX CSS的神器，支持CSSJS实时预览](https://forum.freemdict.com/t/topic/1251)
 
+<img src="docs/screenshot.png" width="900" alt="prev 界面截图">
+
 ## 与 Preview 的关系
 
 本项目起源于对 Preview 0.1.8 的静态逆向与协议重建：沿用它的路由家族（`/api/parser`、`/api/item`、`/api/lookup`、`/api/static`、`/api/v1/ws/`、`/dist`）、WebSocket RPC 与词条模板占位符，之后重写解析器、改为单文件 CLI，并加入多词典与惰性索引。反编译无法恢复原版源码，函数体是重建的。

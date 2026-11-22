@@ -1,6 +1,6 @@
 [package]
 name = "prev"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Single-file MDict (.mdx/.mdd) viewer with multi-dictionary support"
 license = "MIT OR Apache-2.0"

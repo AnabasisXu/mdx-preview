@@ -169,7 +169,12 @@ def main():
             assert reply["result"]["word"] and reply["result"]["k_id"] >= 1, reply
             ws_send(s, {"id": 4, "method": "initials", "dict": 1, "params": []})
             reply = ws_recv(s)
-            assert reply["result"], reply
+            anchors = reply["result"]
+            assert anchors and anchors[0][1] == 0, anchors[:2]
+            offsets = [a[1] for a in anchors]
+            assert offsets == sorted(offsets), "anchor offsets must increase"
+            assert offsets[-1] == dicts[1]["count"] - 1, offsets[-1]
+            assert all(isinstance(a[0], str) for a in anchors), anchors[:2]
             ws_send(s, {"id": 5, "method": "suggest_words", "dict": 9, "params": ["", 0, False]})
             reply = ws_recv(s)
             assert reply["error"] == "unknown dictionary", reply

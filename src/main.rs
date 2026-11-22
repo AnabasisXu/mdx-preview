@@ -896,8 +896,6 @@ struct Dict {
     name: String,
     path: PathBuf,
     mdx: Mdx,
-    /// Jump bar buckets: (label, first index, last index) in file order.
-    initials: OnceLock<Vec<(String, usize, usize)>>,
     /// .mdd archives, indexed on first resource request.
     resources: OnceLock<Resources>,
 }
@@ -913,7 +911,6 @@ impl Dict {
             name,
             path,
             mdx,
-            initials: OnceLock::new(),
             resources: OnceLock::new(),
         }
     }
@@ -984,12 +981,25 @@ impl Dict {
         self.mdx.text(id)
     }
 
-    fn initials(&self) -> Result<&Vec<(String, usize, usize)>, String> {
-        if let Some(v) = self.initials.get() {
-            return Ok(v);
-        }
+    /// Jump bar anchors at exactly `requested` evenly spaced positions: the
+    /// first is entry 0, the last is the final entry, the rest are equidistant.
+    fn anchors(&self, requested: usize) -> Result<Vec<(String, usize)>, String> {
         let words = &self.index()?.words;
-        Ok(self.initials.get_or_init(|| build_initials(words)))
+        let n = words.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let count = requested.clamp(2, 64).min(n);
+        let mut out = Vec::with_capacity(count);
+        for at in anchor_positions(n, count) {
+            let label = words[at]
+                .chars()
+                .next()
+                .map(String::from)
+                .unwrap_or_default();
+            out.push((label, at));
+        }
+        Ok(out)
     }
 
     fn resources(&self) -> &Resources {
@@ -997,42 +1007,17 @@ impl Dict {
     }
 }
 
-/// First-character jump bar. ASCII letters/digits get one bucket each; other
-/// scripts (CJK, kana, ...) are sampled down so the strip stays usable.
-fn build_initials(words: &[String]) -> Vec<(String, usize, usize)> {
-    let mut map: HashMap<String, (usize, usize, usize)> = HashMap::new();
-    for (i, word) in words.iter().enumerate() {
-        let Some(first) = word.chars().next() else {
-            continue;
-        };
-        let label = if first.is_ascii_alphanumeric() {
-            first.to_ascii_lowercase().to_string()
+/// Jump bar anchors: exactly `count` positions through the headword list, first
+/// at index 0 and last at the final entry.
+fn anchor_positions(n: usize, count: usize) -> impl Iterator<Item = usize> {
+    let count = count.max(1);
+    (0..count).map(move |i| {
+        if count <= 1 {
+            0
         } else {
-            first.to_string()
-        };
-        map.entry(label)
-            .and_modify(|(_, last, count)| {
-                *last = i;
-                *count += 1;
-            })
-            .or_insert((i, i, 1));
-    }
-    // A bucket with a single headword is a dead end, so drop it.
-    let (mut ascii, mut other): (Vec<_>, Vec<_>) = map
-        .into_iter()
-        .filter(|(_, (_, _, count))| *count > 1)
-        .map(|(label, (first, last, _))| (label, first, last))
-        .partition(|(label, _, _)| label.chars().all(|c| c.is_ascii_alphanumeric()));
-    ascii.sort_by(|a, b| a.0.cmp(&b.0));
-    other.sort_by_key(|(_, first, _)| *first);
-    const MAX_BUCKETS: usize = 48;
-    if !other.is_empty() && ascii.len() + other.len() > MAX_BUCKETS {
-        let keep = MAX_BUCKETS.saturating_sub(ascii.len()).max(8);
-        let step = ((other.len() as f64) / (keep as f64)).ceil() as usize;
-        other = other.into_iter().step_by(step.max(1)).collect();
-    }
-    ascii.extend(other);
-    ascii
+            i * (n - 1) / (count - 1)
+        }
+    })
 }
 
 fn rand_index(n: usize) -> usize {
@@ -1376,23 +1361,20 @@ fn rpc_reply(
                 "k_id": (i + 1) as u32,
             })))
         }
-        "initials" => Ok(ok(json!(dict.initials()?))),
+        "initials" => {
+            let count = params.get(0).and_then(|p| p.as_u64()).unwrap_or(64) as usize;
+            Ok(ok(json!(dict.anchors(count)?)))
+        }
         "jump" => {
-            let label = params.get(0).and_then(|p| p.as_str()).unwrap_or("");
+            let at = params.get(0).and_then(|p| p.as_u64()).unwrap_or(0) as usize;
             let desc = params.get(1).and_then(|p| p.as_bool()).unwrap_or(false);
             let n = dict.index()?.words.len();
-            let offset = dict
-                .initials()?
-                .iter()
-                .find(|(l, _, _)| l == label)
-                .map(|(_, first, last)| {
-                    if desc {
-                        n.saturating_sub(1).saturating_sub(*last)
-                    } else {
-                        *first
-                    }
-                })
-                .unwrap_or(0);
+            let at = at.min(n.saturating_sub(1));
+            let offset = if desc {
+                n.saturating_sub(1).saturating_sub(at)
+            } else {
+                at
+            };
             Ok(ok(json!({"offset": offset})))
         }
         "redirect" => {

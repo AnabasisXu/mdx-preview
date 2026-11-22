@@ -111,6 +111,17 @@
                 target.scrollIntoView();
             }
         });
+        // This pane is read-only; keyboard focus belongs to the shell, where the
+        // app's shortcuts and Surfingkeys listen. Clicking text would otherwise
+        // move focus into this frame and silently disable them. A drag that
+        // selects text keeps focus here so Ctrl+C still copies the entry.
+        document.addEventListener('mouseup', function () {
+            var sel = window.getSelection();
+            if (sel && !sel.isCollapsed) return;
+            setTimeout(function () {
+                try { parent.focus(); } catch (e) { }
+            }, 0);
+        }, true);
     </script>
 </body>
 

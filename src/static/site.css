@@ -201,12 +201,10 @@ body {
     display: flex;
     gap: 2px;
     padding: 3px 6px;
-    overflow-x: auto;
-    overflow-y: hidden;
+    overflow: hidden;
     white-space: nowrap;
     background: #fbfcfd;
     border-bottom: 1px solid var(--border-soft);
-    scrollbar-width: thin;
 }
 
 #initials:empty {
@@ -214,8 +212,8 @@ body {
 }
 
 .initial {
-    flex: 0 0 auto;
-    min-width: 18px;
+    flex: 0 1 auto;
+    min-width: 16px;
     height: 20px;
     padding: 0 3px;
     font-family: inherit;

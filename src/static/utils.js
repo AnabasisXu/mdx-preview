@@ -19,6 +19,9 @@ var state = {
     desc: false,
     gen: 0,
     total: 0,
+    anchors: [],
+    anchor_count: 0,
+    anchor_want: 0,
     pendingMove: 0,
     k_id: null
 };
@@ -250,7 +253,7 @@ function search(query) {
     load_at(0);
 }
 
-function jump(label) {
+function jump(offset) {
     els.query.value = '';
     state.query = '';
     clear_list();
@@ -260,7 +263,7 @@ function jump(label) {
         state.base = (result && result.offset) || 0;
         els.list.scrollTop = 0;
         load_at(state.base);
-    }, 'jump', label, state.desc);
+    }, 'jump', offset, state.desc);
 }
 
 // ------------------------------------------------------------------ actions
@@ -417,24 +420,56 @@ function set_order(desc) {
 
 // ------------------------------------------------------------------ initials
 
+// The server returns exactly as many anchors as asked, evenly spaced with the
+// first at entry 0 and the last at the final entry. Ask for as many as fit the
+// sidebar so the strip never scrolls sideways.
+var ANCHOR_MIN_PX = 20;
+
+function anchor_fit() {
+    var slot = els.initials.parentElement
+        ? els.initials.parentElement.clientWidth - 12
+        : 0;
+    var width = slot > 0 ? slot : 200;
+    return Math.max(2, Math.floor((width + 2) / ANCHOR_MIN_PX));
+}
+
 function load_initials() {
+    state.anchors = [];
+    state.anchor_count = 0;
+    render_initials();
+}
+
+function render_initials() {
     if (!rpc) return;
+    var want = anchor_fit();
+    if (state.anchor_count === want) {
+        paint_initials();
+        return;
+    }
+    state.anchor_want = want;
     rpc(function (rows) {
-        if (!rows) return;
-        els.initials.textContent = '';
-        rows.forEach(function (row) {
-            var btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'initial';
-            btn.textContent = row[0];
-            btn.title = '跳到 ' + row[0];
-            btn.addEventListener('click', function () {
-                jump(row[0]);
-                els.query.focus();
-            });
-            els.initials.appendChild(btn);
+        if (state.anchor_want !== want) return;  // a newer request won
+        state.anchors = rows || [];
+        state.anchor_count = want;
+        paint_initials();
+    }, 'initials', want);
+}
+
+function paint_initials() {
+    els.initials.textContent = '';
+    (state.anchors || []).forEach(function (row) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'initial';
+        btn.textContent = row[0];
+        btn.title = '跳到第 ' + (row[1] + 1) + ' 条（' + row[0] + '）';
+        btn.dataset.offset = row[1];
+        btn.addEventListener('click', function (e) {
+            jump(parseInt(e.currentTarget.dataset.offset, 10));
+            els.query.focus();
         });
-    }, 'initials');
+        els.initials.appendChild(btn);
+    });
 }
 
 // ------------------------------------------------------------------ layout
@@ -468,6 +503,7 @@ function bind_splitter() {
         els.entry.style.pointerEvents = '';
         var width = document.getElementById('sidebar').getBoundingClientRect().width;
         set_width(width, true);
+        render_initials();
     }
     els.splitter.addEventListener('pointerup', stop);
     els.splitter.addEventListener('pointercancel', stop);
@@ -562,6 +598,7 @@ function bind_events() {
         if (state.hasMore && els.list.scrollHeight <= els.list.clientHeight + 8) {
             load_more();
         }
+        render_initials();
     });
 
     els.sortBtn.addEventListener('click', function () {

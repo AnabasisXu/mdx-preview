@@ -87,6 +87,7 @@ prev <path>... [--port N] [--base PATH]
 - **热更新**：词典同目录下与资源同相对路径的 `.css` / `.js` 会**优先于** `.mdd` 内的副本（`Cache-Control: no-store`）；文件保存时 `notify` 监听目录，WebSocket 广播 `{"event":"reload","dict":N}`，浏览器重载当前词条并带时间戳绕过缓存。其他文件仍从 `.mdd` 读取
 - **链接**：渲染词条时把 `href="entry://词头"` 改写为词条路由（查不到目标词头则保留原样），`src|href="sound://文件"` 改写为 `.mdd` 资源路由
 - **挂载**：所有路由通过 `web::scope(--base)` 挂载，页面内生成的链接与路由前缀一致；裸 `/` 302 到前缀
+- **同源**：WebSocket 握手校验 `Origin` 的 host 与 `Host` 一致，跨站页面无法连接本地服务读取词典；不带 `Origin` 的本地客户端（脚本、测试）照常可用
 
 ## 性能（Linux 实测：Debian 13，4 vCPU，8 GB）
 
@@ -147,7 +148,7 @@ python3 tests/smoke.py target/release/prev /path/to/sample.mdx
 # ok: 2 dictionaries, HTTP and WS contract verified
 ```
 
-脚本用同一份词典的两个副本加一个截断文件启动 prev，检查词典列表、每部词条的 `<base>`、lookup、未知词典 404、WebSocket 的 `dict` 路由与 `redirect` 广播、同目录 CSS 覆盖（磁盘文件优先于 `.mdd`）、以及损坏文件被跳过。
+脚本用同一份词典的两个副本加一个截断文件启动 prev，检查词典列表、每部词条的 `<base>`、lookup、未知词典 404、WebSocket 的 `dict` 路由与 `redirect` 广播、跨站 `Origin` 被拒（403）、同目录 CSS 覆盖（磁盘文件优先于 `.mdd`）、保存 CSS 后收到 `reload` 事件，以及损坏文件被跳过。
 
 ## 更新记录
 

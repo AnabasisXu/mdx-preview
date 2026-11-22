@@ -133,12 +133,18 @@ function bind_ws() {
     });
 }
 
-// A CSS/JS file next to the dictionary was saved. Reload the entry with a
-// cache-busting suffix so the stylesheet link picks up the new bytes.
+// A CSS/JS file next to the dictionary was saved. Coalesce the burst of events
+// an editor save produces, then reload the entry with a cache-busting suffix so
+// the stylesheet link picks up the new bytes.
+var reloadTimer = null;
 function reload_entry() {
     if (!state.k_id) return;
-    var url = '/api/d/' + state.dict + '/item/' + state.k_id + '?t=' + Date.now();
-    els.entry.setAttribute('src', url);
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(function () {
+        if (!state.k_id) return;
+        var url = '/api/d/' + state.dict + '/item/' + state.k_id + '?t=' + Date.now();
+        els.entry.setAttribute('src', url);
+    }, 200);
 }
 
 // ------------------------------------------------------------------ results
@@ -285,7 +291,10 @@ function navigate(k_id, remember) {
     if (remember !== false) record_history(k_id);
     state.k_id = parseInt(k_id, 10);
     var url = '/api/d/' + state.dict + '/item/' + k_id;
-    if (els.entry.getAttribute('src') !== url) {
+    // Ignore the hot-reload cache-buster: re-picking the same entry should not
+    // reload the iframe a second time.
+    var current = (els.entry.getAttribute('src') || '').split('?')[0];
+    if (current !== url) {
         els.entry.setAttribute('src', url);
     }
     mark_current(k_id);
@@ -458,9 +467,12 @@ function render_initials() {
         paint_initials();
         return;
     }
+    var dict = state.dict;
     state.anchor_want = want;
     rpc(function (rows) {
-        if (state.anchor_want !== want) return;  // a newer request won
+        // A newer request or a dictionary switch wins; a late reply from the
+        // previous dictionary must not repaint the strip.
+        if (state.anchor_want !== want || state.dict !== dict) return;
         state.anchors = rows || [];
         state.anchor_count = want;
         paint_initials();

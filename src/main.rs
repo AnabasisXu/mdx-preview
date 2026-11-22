@@ -1083,6 +1083,20 @@ fn render_item(dict: &Dict, title: &str, body_html: &str) -> String {
 /// Rewrite MDict pseudo-schemes in entry HTML: `entry://word` becomes a link to
 /// the target entry (when the headword exists), `sound://file` a resource link.
 fn rewrite_links(dict: &Dict, item_base: &str, res_base: &str, body: &str) -> String {
+    rewrite_links_with(item_base, res_base, body, |word| entry_id(dict, word))
+}
+
+/// `resolve` maps a decoded headword to its id; split out so the rewriter can be
+/// tested without a container.
+fn rewrite_links_with<F>(
+    item_base: &str,
+    res_base: &str,
+    body: &str,
+    resolve: F,
+) -> String
+where
+    F: Fn(&str) -> Option<u32>,
+{
     let mut out = String::with_capacity(body.len());
     let mut copied = 0usize;
     let mut search = 0usize;
@@ -1092,7 +1106,15 @@ fn rewrite_links(dict: &Dict, item_base: &str, res_base: &str, body: &str) -> St
             break;
         };
         let quote = body.as_bytes()[quote_pos] as char;
-        if !body[..quote_pos].trim_end().ends_with('=') {
+        let attr = attr_name_before(body, quote_pos);
+        let allowed = if entry {
+            attr.eq_ignore_ascii_case("href")
+        } else {
+            attr.eq_ignore_ascii_case("src") || attr.eq_ignore_ascii_case("href")
+        };
+        // Only a value that *is* the scheme is rewritten; "…?u=entry://x" is
+        // not a link and rewriting it would corrupt the attribute.
+        if !allowed || !body[..quote_pos].trim_end().ends_with('=') {
             search = pos + 1;
             continue;
         }
@@ -1101,16 +1123,20 @@ fn rewrite_links(dict: &Dict, item_base: &str, res_base: &str, body: &str) -> St
         };
         let end = pos + end_rel;
         let value = &body[pos..end];
+        let scheme = if entry { "entry://" } else { "sound://" };
+        // The value must be exactly the scheme, starting right after the quote;
+        // "?u=entry://x" is not a link.
+        if pos != quote_pos + 1 || !value.starts_with(scheme) {
+            search = end + 1;
+            continue;
+        }
         let target = if entry {
-            let word = value.trim_start_matches("entry://");
+            let word = &value[scheme.len()..];
             let word = word.split('#').next().unwrap_or(word);
             let word = percent_encoding::percent_decode_str(word).decode_utf8_lossy();
-            entry_id(dict, word.trim()).map(|id| format!("{item_base}{id}"))
+            resolve(word.trim()).map(|id| format!("{item_base}{id}"))
         } else {
-            Some(format!(
-                "{res_base}{}",
-                value.trim_start_matches("sound://")
-            ))
+            Some(format!("{res_base}{}", encode_res_path(&value[scheme.len()..])))
         };
         if let Some(url) = target {
             out.push_str(&body[copied..quote_pos + 1]);
@@ -1120,6 +1146,45 @@ fn rewrite_links(dict: &Dict, item_base: &str, res_base: &str, body: &str) -> St
         search = end + 1;
     }
     out.push_str(&body[copied..]);
+    out
+}
+
+/// Attribute name immediately before the opening quote of a value.
+fn attr_name_before(body: &str, quote_pos: usize) -> &str {
+    let mut at = quote_pos;
+    let bytes = body.as_bytes();
+    while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+        at -= 1;
+    }
+    if at > 0 && bytes[at - 1] == b'=' {
+        at -= 1;
+    }
+    while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+        at -= 1;
+    }
+    let end = at;
+    while at > 0
+        && (bytes[at - 1].is_ascii_alphanumeric()
+            || bytes[at - 1] == b'-'
+            || bytes[at - 1] == b'_'
+            || bytes[at - 1] == b':')
+    {
+        at -= 1;
+    }
+    &body[at..end]
+}
+
+fn encode_res_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '%' => out.push_str("%25"),
+            _ => out.push(c),
+        }
+    }
     out
 }
 
@@ -1362,6 +1427,11 @@ async fn ws(
     body: web::Payload,
     state: web::Data<AppState>,
 ) -> actix_web::Result<HttpResponse> {
+    // WebSockets bypass CORS, so without this any website could read the whole
+    // dictionary through this endpoint.
+    if !origin_allowed(&req) {
+        return Ok(HttpResponse::Forbidden().body("cross-origin websocket rejected"));
+    }
     let (response, session, msg_stream) = actix_ws::handle(&req, body)?;
     let mut rx = state.tx.subscribe();
     let state2 = state.clone();
@@ -1418,6 +1488,31 @@ async fn ws(
         let _ = stop_tx.send(());
     });
     Ok(response)
+}
+
+/// Browsers send an Origin header; accept only the page served by this same
+/// host (requests without Origin, e.g. test clients, are allowed).
+fn origin_allowed(req: &HttpRequest) -> bool {
+    let Some(origin) = req
+        .headers()
+        .get(actix_web::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return true;
+    };
+    let host = req
+        .headers()
+        .get(actix_web::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let authority = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    !host.is_empty() && authority.eq_ignore_ascii_case(host)
 }
 
 /// One WebSocket request; errors become the reply's `error` field.
@@ -1554,9 +1649,9 @@ fn discover(inputs: &[String]) -> Vec<PathBuf> {
     out
 }
 
-/// Watch each dictionary directory for CSS/JS saves and fan a reload event out
-/// to every client viewing that dictionary. Non-recursive: resources live next
-/// to the .mdx.
+/// Watch each dictionary directory (recursively, so nested `css/` and `js/`
+/// overrides reload too) and fan a reload event out to every client viewing
+/// that dictionary.
 fn spawn_watcher(dirs: Vec<(PathBuf, Vec<usize>)>, tx: broadcast::Sender<String>) {
     std::thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
@@ -1573,7 +1668,7 @@ fn spawn_watcher(dirs: Vec<(PathBuf, Vec<usize>)>, tx: broadcast::Sender<String>
         let mut seen = HashSet::new();
         for (dir, _) in &dirs {
             if seen.insert(dir.clone()) {
-                if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
                     eprintln!("prev: cannot watch {}: {e}", dir.display());
                 }
             }
@@ -1592,7 +1687,7 @@ fn spawn_watcher(dirs: Vec<(PathBuf, Vec<usize>)>, tx: broadcast::Sender<String>
                 continue;
             }
             for (dir, ids) in &dirs {
-                if event.paths.iter().any(|p| p.parent() == Some(dir.as_path())) {
+                if event.paths.iter().any(|p| p.starts_with(dir)) {
                     for id in ids {
                         let _ = tx.send(json!({"event": "reload", "dict": id}).to_string());
                     }
@@ -1700,4 +1795,51 @@ async fn main() -> std::io::Result<()> {
     };
     println!("{listening}");
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rw(body: &str) -> String {
+        rewrite_links_with("/i/", "/r/", body, |word| {
+            if word == "foo" {
+                Some(7)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn rewrites_entry_links() {
+        assert_eq!(
+            rw(r#"<a href="entry://foo">x</a>"#),
+            r#"<a href="/i/7">x</a>"#
+        );
+        assert_eq!(
+            rw("<a href='entry://foo#part'>x</a>"),
+            "<a href='/i/7'>x</a>"
+        );
+    }
+
+    #[test]
+    fn rewrites_sound_links() {
+        assert_eq!(
+            rw(r#"<audio src="sound://a b.mp3"></audio>"#),
+            r#"<audio src="/r/a%20b.mp3"></audio>"#
+        );
+    }
+
+    #[test]
+    fn leaves_unknown_and_non_links_alone() {
+        let body = r#"<a href="entry://missing">m</a><span data-x="entry://foo">d</span><p>entry://foo</p>"#;
+        assert_eq!(rw(body), body);
+    }
+
+    #[test]
+    fn leaves_prefixed_values_alone() {
+        let body = r#"<a href="?u=entry://foo">x</a>"#;
+        assert_eq!(rw(body), body);
+    }
 }

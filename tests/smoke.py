@@ -59,6 +59,40 @@ def ws_open(port):
     return s
 
 
+def ws_handshake(port, origin=None):
+    key = base64.b64encode(os.urandom(16)).decode()
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    extra = f"Origin: {origin}\r\n" if origin else ""
+    s.sendall(
+        (
+            f"GET /mdx-preview/api/v1/ws/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n"
+        ).encode()
+    )
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    s.close()
+    return head.split(b"\r\n")[0]
+
+
+def ws_recv_timeout(s, seconds):
+    deadline = time.time() + seconds
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            raise AssertionError("no websocket event before timeout")
+        s.settimeout(left)
+        try:
+            return ws_recv(s)
+        except socket.timeout:
+            continue
+
+
 def ws_send(s, payload):
     data = json.dumps(payload).encode()
     n = len(data)
@@ -149,9 +183,23 @@ def main():
         get(f"{base}/api/d/9/item/1", expect=404)
         get(f"{base}/api/d/9/lookup/ab", expect=404)
         get(f"{base}/api/d/0/res/missing.png", expect=404)
+        assert b" 403 " in ws_handshake(port, "http://evil.example")
+        assert b" 101 " in ws_handshake(port, f"http://127.0.0.1:{port}")
+
         # A real .css next to the dictionary shadows the .mdd copy.
         assert get(f"{base}/api/d/0/res/alpha.css") == css
         get(f"{base}/api/d/1/res/alpha.css", expect=404)
+
+        # Saving that file must notify every client of that dictionary.
+        watcher = ws_open(port)
+        try:
+            with open(os.path.join(work, "one", "alpha.css"), "wb") as f:
+                f.write(b"body{color:blue}\n")
+            event = ws_recv_timeout(watcher, 6)
+            assert event.get("event") == "reload", event
+            assert event.get("dict") == 0, event
+        finally:
+            watcher.close()
         get(f"http://127.0.0.1:{port}/favicon.ico", expect=204)
 
         # The shell must not be cached, or an upgraded binary keeps serving the
